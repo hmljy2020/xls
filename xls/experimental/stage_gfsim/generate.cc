@@ -230,6 +230,29 @@ std::string Quote(std::string_view string) {
 
 using Variables = std::unordered_map<const Node*, std::string>;
 
+struct StageSlot {
+  std::string type;
+  std::string member;
+  Variables fields;
+
+  std::string Pending() const { return absl::StrCat("next_", member); }
+  std::string Consumed() const { return absl::StrCat("consumed_", member); }
+};
+
+struct StateMembers {
+  std::string value;
+  bool has_write = false;
+  bool has_feedback = false;
+
+  std::string Pending() const { return absl::StrCat("next_", value); }
+  std::string Available() const { return absl::StrCat("available_", value); }
+  std::string NextAvailable() const {
+    return absl::StrCat("next_available_", value);
+  }
+};
+
+using States = std::unordered_map<const StateElement*, StateMembers>;
+
 std::string CppName(NameUniquer& names, std::string_view prefix,
                     std::string_view ir_name) {
   std::string name(prefix);
@@ -380,28 +403,33 @@ std::string PredicateArg(std::optional<Node*> predicate,
 }
 
 void EmitNode(std::ostream& output, const Node& node, const Variables& names,
-              const Variables& ports, NameUniquer& unique) {
+              const Variables& ports, const States& states,
+              NameUniquer& unique) {
   const std::string& name = names.at(&node);
-  const char* declaration = node.GetType()->IsToken() || node.users().empty()
-                                ? "[[maybe_unused]] const Value "
-                                : "const Value ";
-  if (node.Is<Receive>() || node.Is<StateRead>()) {
-    std::string call;
-    if (node.Is<Receive>()) {
-      call = absl::StrCat(
-          "stage.Receive(", ports.at(&node), "_, ", Quote(node.GetName()),
-          PredicateArg(node.As<Receive>()->predicate(), names), ")");
-    } else {
-      call = absl::StrCat("stage.ReadState(",
-                          Quote(node.As<StateRead>()->state_element()->name()),
-                          ")");
-    }
+  const char* attribute = node.GetType()->IsToken() || node.users().empty()
+                              ? "[[maybe_unused]] "
+                              : "";
+  if (node.Is<Receive>()) {
     const std::string pending = unique.GetSanitizedUniqueName(name + "_result");
-    output << "    const auto " << pending << " = " << call << ";\n"
+    output << "    const auto " << pending << " = stage.Receive("
+           << ports.at(&node) << "_, " << Quote(node.GetName())
+           << PredicateArg(node.As<Receive>()->predicate(), names) << ");\n"
            << "    if (!" << pending << ".has_value()) {\n"
            << "      return;\n"
            << "    }\n"
            << "    const Value& " << name << " = *" << pending << ";\n";
+    return;
+  }
+  if (node.Is<StateRead>()) {
+    const StateMembers& state =
+        states.at(node.As<StateRead>()->state_element());
+    if (state.has_feedback) {
+      output << "    if (!stage.StateReady(" << state.Available() << ")) {\n"
+             << "      return;\n"
+             << "    }\n";
+    }
+    output << "    " << attribute << "const Value& " << name << " = "
+           << state.value << ";\n";
     return;
   }
   if (node.Is<Send>()) {
@@ -412,17 +440,15 @@ void EmitNode(std::ostream& output, const Node& node, const Variables& names,
            << "      return;\n"
            << "    }\n";
     if (!node.users().empty()) {
-      output << "    " << declaration << name << " = Value::Token();\n";
+      output << "    " << attribute << "const Value " << name
+             << " = Value::Token();\n";
     }
     return;
   }
   if (node.Is<Next>()) {
-    const Next* next = node.As<Next>();
-    output << "    stage.WriteState(" << Quote(next->state_element()->name())
-           << ", " << names.at(next->value())
-           << PredicateArg(next->predicate(), names) << ");\n";
     if (!node.users().empty()) {
-      output << "    " << declaration << name << " = Value::Tuple({});\n";
+      output << "    " << attribute << "const Value " << name
+             << " = Value::Tuple({});\n";
     }
     return;
   }
@@ -432,19 +458,53 @@ void EmitNode(std::ostream& output, const Node& node, const Variables& names,
     expr = absl::StrCat("stage.Interpret(", Quote(node.GetName()), ", {",
                         Operands(node, names), "})");
   }
-  output << "    " << declaration << name << " = " << expr << ";\n";
+  output << "    " << attribute << "const Value " << name << " = " << expr
+         << ";\n";
+}
+
+void EmitStateProposals(std::ostream& output, const StageDescription& stage,
+                        const States& states, const Variables& names) {
+  for (const Node* node : stage.nodes) {
+    if (node->Is<StateRead>()) {
+      const StateMembers& state =
+          states.at(node->As<StateRead>()->state_element());
+      if (state.has_feedback) {
+        output << "    " << state.NextAvailable() << " = false;\n";
+      }
+    } else if (node->Is<Next>()) {
+      const Next* next = node->As<Next>();
+      const StateMembers& state = states.at(next->state_element());
+      const std::string assignment =
+          absl::StrCat(state.Pending(), " = ", names.at(next->value()), ";\n");
+      if (auto predicate = next->predicate()) {
+        output << "    if (!" << names.at(*predicate) << ".bits().IsZero()) {\n"
+               << "      " << assignment << "    }\n";
+      } else {
+        output << "    " << assignment;
+      }
+      if (state.has_feedback) {
+        output << "    " << state.NextAvailable() << " = true;\n";
+      }
+    }
+  }
 }
 
 void EmitStage(std::ostream& output, const StageDescription& stage,
-               size_t index, const Variables& ports) {
+               size_t index, const std::vector<StageSlot>& slots,
+               const Variables& ports, const States& states) {
+  const StageSlot* input = index == 0 ? nullptr : &slots[index - 1];
+  const StageSlot* next = index == slots.size() ? nullptr : &slots[index];
+  const std::string input_valid =
+      input ? absl::StrCat(input->member, ".has_value()") : "true";
+  const std::string output_ready =
+      next ? absl::StrCat("!", next->member, " || ", next->Consumed()) : "true";
   output << "  void WorkStage" << index << "() {\n"
-         << "    if (!proc_.StageReady(" << index << ", pipeline_.InputValid("
-         << index << "),\n"
-         << "                          pipeline_.OutputReady(" << index
-         << "))) {\n"
+         << "    if (!proc_.StageReady(" << index << ", " << input_valid
+         << ",\n"
+         << "                          " << output_ready << ")) {\n"
          << "      return;\n"
          << "    }\n"
-         << "    StageContext stage(proc_, pipeline_, " << index << ");\n";
+         << "    StageContext stage(proc_, " << index << ");\n";
   NameUniquer unique("_");
   Variables names;
   std::unordered_set<const Node*> local(stage.nodes.begin(), stage.nodes.end());
@@ -454,14 +514,14 @@ void EmitStage(std::ostream& output, const StageDescription& stage,
     }
     const std::string name = CppName(unique, "v_", node->GetName());
     names.emplace(node, name);
-    output << (node->GetType()->IsToken() ? "    [[maybe_unused]] " : "    ")
-           << "const Value " << name << " = ";
+    output << (node->GetType()->IsToken() ? "    [[maybe_unused]] " : "    ");
     if (node->Is<Literal>()) {
-      output << LiteralExpression(*node->As<Literal>());
+      output << "const Value " << name << " = "
+             << LiteralExpression(*node->As<Literal>()) << ";\n";
     } else {
-      output << "stage.Input(" << Quote(node->GetName()) << ")";
+      output << "const Value& " << name << " = " << input->member << "->"
+             << input->fields.at(node) << ";\n";
     }
-    output << ";\n";
   };
   for (const Node* node : stage.nodes) {
     for (const Node* operand : node->operands()) {
@@ -473,19 +533,110 @@ void EmitStage(std::ostream& output, const StageDescription& stage,
   }
   for (const Node* node : stage.nodes) {
     names.emplace(node, CppName(unique, "v_", node->GetName()));
-    EmitNode(output, *node, names, ports, unique);
+    EmitNode(output, *node, names, ports, states, unique);
   }
-  for (const Node* live : stage.live_out) {
-    output << "    stage.Forward(" << Quote(live->GetName()) << ", "
-           << names.at(live) << ");\n";
+  output << "    stage.Finish();\n";
+  EmitStateProposals(output, stage, states, names);
+  if (input) {
+    output << "    " << input->Consumed() << " = true;\n";
   }
-  output << "    pipeline_.Advance(" << index << ", stage.Commit());\n"
-         << "  }\n\n";
+  if (next) {
+    output << "    " << next->Pending() << " = " << next->type << "{";
+    if (!stage.live_out.empty()) {
+      output << "\n";
+      for (const Node* live : stage.live_out) {
+        output << "        ." << next->fields.at(live) << " = "
+               << names.at(live) << ",\n";
+      }
+      output << "    ";
+    }
+    output << "};\n";
+  }
+  output << "  }\n\n";
+}
+
+void EmitReset(std::ostream& output, const Proc& proc,
+               const std::vector<StageSlot>& slots, const States& states) {
+  output << "  void Reset() override {\n"
+         << "    proc_.Reset();\n";
+  for (const StageSlot& slot : slots) {
+    output << "    " << slot.member << ".reset();\n"
+           << "    " << slot.Pending() << ".reset();\n"
+           << "    " << slot.Consumed() << " = false;\n";
+  }
+  for (const StateElement* element : proc.StateElements()) {
+    const StateMembers& state = states.at(element);
+    output << "    " << state.value << " = proc_.InitialState("
+           << Quote(element->name()) << ");\n";
+    if (state.has_write) {
+      output << "    " << state.Pending() << ".reset();\n";
+    }
+    if (state.has_feedback) {
+      output << "    " << state.Available() << " = true;\n"
+             << "    " << state.NextAvailable() << " = true;\n";
+    }
+  }
+  output << "  }\n\n";
+}
+
+void EmitXfer(std::ostream& output, const Proc& proc,
+              const std::vector<StageSlot>& slots, const States& states) {
+  output << "  void Xfer() override {\n";
+  for (const StageSlot& slot : slots) {
+    output << "    if (" << slot.Pending() << " || " << slot.Consumed()
+           << ") {\n"
+           << "      " << slot.member << " = std::exchange(" << slot.Pending()
+           << ", std::nullopt);\n"
+           << "    }\n"
+           << "    " << slot.Consumed() << " = false;\n";
+  }
+  for (const StateElement* element : proc.StateElements()) {
+    const StateMembers& state = states.at(element);
+    if (state.has_write) {
+      output << "    if (" << state.Pending() << ") {\n"
+             << "      " << state.value << " = std::move(*" << state.Pending()
+             << ");\n"
+             << "      " << state.Pending() << ".reset();\n"
+             << "    }\n";
+    }
+    if (state.has_feedback) {
+      output << "    " << state.Available() << " = " << state.NextAvailable()
+             << ";\n";
+    }
+  }
+  output << "  }\n\n";
 }
 
 void EmitProc(std::ostream& output, const ProcDescription& proc,
               std::string_view name) {
   NameUniquer unique("_");
+  std::vector<StageSlot> slots;
+  for (size_t i = 1; i < proc.stages.size(); ++i) {
+    StageSlot slot{.type = absl::StrCat("Stage", i, "Input"),
+                   .member = absl::StrCat("s", i - 1, "_to_s", i, "_"),
+                   .fields = {}};
+    NameUniquer fields("_");
+    for (const Node* node : proc.stages[i - 1].live_out) {
+      slot.fields.emplace(node, CppName(fields, "v_", node->GetName()));
+    }
+    slots.push_back(std::move(slot));
+  }
+  States states;
+  for (const StateElement* element : proc.proc->StateElements()) {
+    std::string name = CppName(unique, "state_", element->name());
+    states.emplace(element, StateMembers{.value = absl::StrCat(name, "_")});
+  }
+  for (Next* write : proc.proc->next_values()) {
+    StateElement* element = write->state_element();
+    StateMembers& state = states.at(element);
+    state.has_write = true;
+    const int64_t write_stage = proc.proc->GetStageIndex(write).value();
+    const auto reads = proc.proc->GetStateReadsByStateElement(element);
+    state.has_feedback =
+        !reads.empty() &&
+        proc.proc->GetStageIndex(reads.front()).value() < write_stage;
+  }
+
   Variables ports;
   output << "class " << name << " final : public gfsim::SimModule {\n"
          << " public:\n"
@@ -509,31 +660,45 @@ void EmitProc(std::ostream& output, const ProcDescription& proc,
            << ports.at(port) << "_.queue);\n";
   }
   output << "  }\n\n"
-         << "  void Build() override { SetObjectCapacity(0); }\n\n"
-         << "  void Reset() override {\n"
-         << "    pipeline_.Reset();\n"
-         << "    proc_.Reset();\n"
-         << "  }\n\n"
-         << "  void Work() override {\n"
-         << "    pipeline_.BeginCycle();\n"
-         << "    proc_.BeginCycle();\n\n"
+         << "  void Build() override { SetObjectCapacity(0); }\n\n";
+  EmitReset(output, *proc.proc, slots, states);
+  output << "  void Work() override {\n"
          << "    // Run downstream first so an upstream stage can refill a "
             "freed slot.\n";
   for (size_t i = proc.stages.size(); i-- > 0;) {
     output << "    WorkStage" << i << "();\n";
   }
-  output << "  }\n\n"
-         << "  void Xfer() override {\n"
-         << "    pipeline_.EndCycle();\n"
-         << "    proc_.PublishState();\n"
-         << "  }\n\n"
-         << "  void ReportStat() override { proc_.ReportStat(Report()); }\n\n"
+  output << "  }\n\n";
+  EmitXfer(output, *proc.proc, slots, states);
+  output << "  void ReportStat() override { proc_.ReportStat(Report()); }\n\n"
          << " private:\n";
-  for (size_t i = 0; i < proc.stages.size(); ++i) {
-    EmitStage(output, proc.stages[i], i, ports);
+  for (size_t i = 0; i < slots.size(); ++i) {
+    const StageSlot& slot = slots[i];
+    output << "  struct " << slot.type << " {\n";
+    for (const Node* node : proc.stages[i].live_out) {
+      output << "    Value " << slot.fields.at(node) << ";\n";
+    }
+    output << "  };\n"
+           << "  std::optional<" << slot.type << "> " << slot.member << ";\n"
+           << "  std::optional<" << slot.type << "> " << slot.Pending() << ";\n"
+           << "  bool " << slot.Consumed() << " = false;\n\n";
   }
-  output << "  Pipeline<StageValues> pipeline_{" << proc.stages.size() << "};\n"
-         << "  ProcRuntime proc_;\n";
+  for (const StateElement* element : proc.proc->StateElements()) {
+    const StateMembers& state = states.at(element);
+    output << "  Value " << state.value << ";\n";
+    if (state.has_write) {
+      output << "  std::optional<Value> " << state.Pending() << ";\n";
+    }
+    if (state.has_feedback) {
+      output << "  bool " << state.Available() << " = true;\n"
+             << "  bool " << state.NextAvailable() << " = true;\n";
+    }
+    output << "\n";
+  }
+  for (size_t i = 0; i < proc.stages.size(); ++i) {
+    EmitStage(output, proc.stages[i], i, slots, ports, states);
+  }
+  output << "  ProcRuntime proc_;\n";
   for (const ChannelNode* port : proc.ports) {
     output << "  const SimChannel& " << ports.at(port) << "_;\n";
   }
@@ -544,6 +709,7 @@ std::string EmitModel(const ModelDescription& model) {
   std::ostringstream output;
   output << "// Generated from XLS scheduled_proc IR.\n"
          << "#include <memory>\n"
+         << "#include <optional>\n"
          << "#include <string>\n"
          << "#include <utility>\n\n"
          << "#include \"absl/status/status.h\"\n"

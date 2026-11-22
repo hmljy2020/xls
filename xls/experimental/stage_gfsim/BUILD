@@ -17,7 +17,7 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
 package(default_applicable_licenses = ["//:license"])
 
-exports_files(["pipeline.h", "proc_runtime.h", "runtime.cc"])
+exports_files(["proc_runtime.h", "runtime.cc"])
 
 cc_library(
     name = "model",

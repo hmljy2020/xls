@@ -26,10 +26,7 @@ cc_library(
 cc_library(
     name = "runtime",
     srcs = ["//xls/experimental/stage_gfsim:runtime.cc"],
-    hdrs = [
-        "//xls/experimental/stage_gfsim:pipeline.h",
-        "//xls/experimental/stage_gfsim:proc_runtime.h",
-    ],
+    hdrs = ["//xls/experimental/stage_gfsim:proc_runtime.h"],
     visibility = ["//xls/experimental/stage_gfsim/out:__subpackages__"],
     deps = [
         ":gfsim",
@@ -47,7 +44,6 @@ cc_library(
         "@abseil-cpp//absl/flags:flag",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/status:statusor",
-        "@abseil-cpp//absl/types:optional_ref",
         "@abseil-cpp//absl/types:span",
     ],
 )

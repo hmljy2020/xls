@@ -6,11 +6,13 @@ Generate readable C++ cycle models directly from XLS `scheduled_proc` IR.
 Model stage-level ready/valid backpressure and state dependencies to estimate
 workload time at a supplied clock period.
 
-Each executing proc definition has a concrete `gfsim::SimModule`. Its `Work()`
-calls the generated stage methods from downstream to upstream, and `Xfer()`
-publishes the next cycle's stage slots and state. Stage methods use XLS bit
-operations and fall back to the XLS node interpreter. The simulator reads the
-matching IR at startup for state initialization and interpreter lookups.
+Each executing proc definition has a concrete `gfsim::SimModule` with named
+members for the data between stages and for persistent proc state. Its `Work()`
+calls the generated stage methods from downstream to upstream. A stage reads
+the current members and records pending changes when it advances. `Xfer()`
+publishes those changes for the next cycle. Stage methods use XLS bit operations
+and fall back to the XLS node interpreter. The simulator reads the matching IR at
+startup for state initialization and interpreter lookups.
 
 ## Current status
 
@@ -79,3 +81,26 @@ workloads also match on every input and output handshake. In the buffered pair,
 ten proc input handshakes occur one cycle later in GFSIM. GFSIM checks FIFO
 capacity at the start of the cycle. The Block IR internal FIFO can accept a
 push while full if a pop occurs that cycle.
+
+## Simulator runtime comparison
+
+All three simulators ran the 451-instruction RISC-V workload with the same
+schedule, inputs, and depth-two external FIFOs. Verilator 5.052 compiled
+SystemVerilog emitted from the same Block IR used by the XLS interpreter. Its
+outputs and handshake cycles matched across both scenarios.
+
+GFSIM and the XLS Block Interpreter used Bazel `-c opt`. Verilator ran in
+single-threaded mode with its C++ model built using Clang 22.1.8 at `-O2`.
+Runs were interleaved on one pinned HiSilicon Kunpeng-920 core (aarch64). The
+table reports median wall-clock times from five runs per simulator and scenario
+after one warmup.
+
+Timing covers the simulation loop through the final output, including FIFO
+handling. All timed runs disable trace formatting and output. Model generation,
+compilation, Block IR lowering, IR and stimulus parsing, initialization, and
+reset are outside the timed region.
+
+| Scenario | Simulated cycles | GFSIM (ms) | Block interpreter (ms) | Verilator (ms) | Block / GFSIM | GFSIM / Verilator |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Steady | 1356 | 104.0 | 564.9 | 0.635 | 5.43× | 163.7× |
+| Backpressure | 1483 | 109.9 | 617.5 | 0.687 | 5.62× | 160.0× |

@@ -76,23 +76,12 @@ ProcRuntime::ProcRuntime(gfsim::SimModule& module, Proc& ir,
   for (Node* node : ir.nodes()) {
     nodes_.emplace(node->GetName(), node);
   }
-  for (Next* write : ir.next_values()) {
-    const int64_t write_stage = ir.GetStageIndex(write).value();
-    for (StateRead* read :
-         ir.GetStateReadsByStateElement(write->state_element())) {
-      if (ir.GetStageIndex(read).value() < write_stage) {
-        feedback_.insert(write->state_element());
-      }
-    }
-  }
 }
 
-void ProcRuntime::Reset() {
-  state_.clear();
-  for (StateElement* element : ir_.StateElements()) {
-    state_.emplace(element, State{element->initial_value()});
-  }
-  stats_.assign(stats_.size(), {});
+void ProcRuntime::Reset() { stats_.assign(stats_.size(), {}); }
+
+const Value& ProcRuntime::InitialState(std::string_view name) const {
+  return ir_.GetStateElementByName(name).value()->initial_value();
 }
 
 bool ProcRuntime::StageReady(std::size_t index, bool input_valid,
@@ -117,10 +106,6 @@ void ProcRuntime::ReportStat(gfsim::Reporter& report) const {
     report.ReportVal(name + ".output_stall_cycles", stage.output);
     report.ReportVal(name + ".state_stall_cycles", stage.state);
   }
-}
-
-const Value& StageContext::Input(std::string_view name) const {
-  return pipeline_.Input(index_).at(name);
 }
 
 const Value& StageContext::Literal(std::string_view name) const {
@@ -166,32 +151,14 @@ bool StageContext::Send(const SimChannel& channel, const Value& value,
   return true;
 }
 
-absl::optional_ref<const Value> StageContext::ReadState(
-    std::string_view element) {
-  const StateElement* key = proc_.ir_.GetStateElementByName(element).value();
-  const ProcRuntime::State& state = proc_.state_.at(key);
-  if (!state.available) {
+bool StageContext::StateReady(bool available) {
+  if (!available) {
     ++proc_.stats_[index_].state;
-    return std::nullopt;
   }
-  if (proc_.feedback_.contains(key)) {
-    reads_.push_back(key);
-  }
-  return state.value;
+  return available;
 }
 
-void StageContext::WriteState(std::string_view element, const Value& value,
-                              bool enabled) {
-  const StateElement* key = proc_.ir_.GetStateElementByName(element).value();
-  writes_.push_back(
-      {key, enabled ? std::optional<Value>(value) : std::nullopt});
-}
-
-void StageContext::Forward(std::string_view name, Value value) {
-  outputs_.emplace(name, std::move(value));
-}
-
-StageValues StageContext::Commit() {
+void StageContext::Finish() {
   gfsim::SimModule& module = proc_.module_;
   const uint64_t cycle = module.GetSim()->Cycles();
   for (const SimChannel* channel : receives_) {
@@ -203,19 +170,8 @@ StageValues StageContext::Commit() {
     channel->queue->Write(std::make_shared<Value>(value));
     Transfer(cycle, "send", module.Name(), *channel->queue, value);
   }
-  for (const StateElement* element : reads_) {
-    proc_.next_state_.at(element).available = false;
-  }
-  for (const auto& [element, value] : writes_) {
-    ProcRuntime::State& state = proc_.next_state_.at(element);
-    if (value) {
-      state.value = *value;
-    }
-    state.available = true;
-  }
   ++proc_.stats_[index_].fired;
   module.GetSim()->MarkProgress();
-  return std::move(outputs_);
 }
 
 namespace {
