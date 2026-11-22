@@ -509,7 +509,7 @@ fn run_b_instruction
 
 // Run a program by iterating over the instruction memory.
 // At this point - only execute a single instruction.
-fn run_instruction
+pub fn run_instruction
     (pc: u32, ins: u32, regs: u32[REG_COUNT], dmem: u8[DMEM_SIZE])
     -> (u32, u32[REG_COUNT], u8[DMEM_SIZE]) {
     let opcode = decode_opcode(ins);

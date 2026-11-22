@@ -1,86 +1,81 @@
 # Stage-level XLS models for GFSIM
 
-This experiment generates a C++ GFSIM model from XLS `scheduled_proc` IR.
-The generated source defines a concrete `gfsim::SimModule` for each proc with
-channel operations or state updates. Stage methods call XLS bit operations
-directly for arithmetic and common data operations and use the XLS node
-interpreter for other operations. The simulator reads the matching IR at
-startup for initial state and interpreter lookups.
+## Design intent
 
-## Run the examples
+Generate readable C++ cycle models directly from XLS `scheduled_proc` IR.
+Model stage-level ready/valid backpressure and state dependencies to estimate
+workload time at a supplied clock period.
 
-From the XLS root, with Bazelisk or Bazel 8.7.0 and a local GFSIM checkout:
+Each executing proc definition has a concrete `gfsim::SimModule`. Its `Work()`
+calls the generated stage methods from downstream to upstream, and `Xfer()`
+publishes the next cycle's stage slots and state. Stage methods use XLS bit
+operations and fall back to the XLS node interpreter. The simulator reads the
+matching IR at startup for state initialization and interpreter lookups.
+
+## Current status
+
+The DSLX → scheduled proc → GFSIM flow runs three examples covering a
+pipeline, a stateful accumulator, and two procs connected by a FIFO. The cycle
+model supports blocking receives, at most one send per stage, a single producer
+and consumer per channel, and empty, positive-depth FIFOs with bypass disabled.
+Each state element can have one unconditional read and at most one write.
+
+Run from the XLS root with Bazelisk or Bazel 8.7.0 and a local GFSIM checkout.
 
 ```bash
 GFSIM_DIR=/home/lc/GFSIM xls/experimental/stage_gfsim/run_examples.sh
 ```
 
-The scripts prefer `bazelisk` when it is installed. Set `BAZEL` to choose
-another executable. The script converts, optimizes, schedules, generates and
-builds each of the three designs. Generated C++, IR, schedules, handshake traces
-and counters are under `out/<example>/`.
+Each `out/<example>/` contains `scheduled.ir`, `model.cc`, handshake traces
+(`.tsv`), and cycle counters (`.stats`). Use `build_model.sh <scheduled.ir>
+<name>` to build a simulator for an existing schedule.
 
-In `model.cc`, start with the proc class's `Work()` and `Xfer()`. `Work()`
-calls the `WorkStageN()` methods in downstream-to-upstream order. Each method
-checks its input valid and output ready, runs the scheduled operations, then
-advances its pipeline slot if the operations complete. `Xfer()` publishes the
-next stage slots and state for the next cycle. `BuildProcs()` constructs the
-modules and connects their named FIFOs.
+## RISC-V experiment
 
-## Build an existing scheduled design
+The RISC-V proc wraps the original `run_instruction()` and holds the
+PC, registers, and data memory. The driver feeds the original test's 13
+instructions and checks the full state returned after each instruction, with
+and without output backpressure. [Proc source](examples/riscv.x) ·
+[Instruction implementation](../../examples/riscv_simple.x)
 
 ```bash
-xls/experimental/stage_gfsim/build_model.sh /path/to/design.scheduled.ir my_model
-bazel-bin/xls/experimental/stage_gfsim/out/my_model/sim \
-  /path/to/design.scheduled.ir --inputs=inputs.txt --cycles=128 \
-  --clock_period_ps=1000
+GFSIM_DIR=/home/lc/GFSIM xls/experimental/stage_gfsim/run_riscv_example.sh
 ```
 
-List one channel name followed by an XLS typed value per line in
-`inputs.txt`. Values for each input are offered in order as its FIFO admits
-them. For example:
+Pass `--long` for a 451-instruction workload. It checks all state snapshots
+through 64 loop iterations with dependent arithmetic, store/load pairs, and
+a conditional branch. The backpressure run holds the sink from cycle 80
+through 211. Traces are under `out/riscv/long/`.
 
-```text
-_input bits[32]:10
-_input bits[32]:20
-```
+The valid-instruction run uses `--emit_assert=false` and
+`--skip_passes=next_value_opt`. The default XLS flow emits IR assertions from
+`fail!()` and splits some state updates into multiple predicated
+`next_value` nodes. The generator supports at most one `next_value` per state
+element and rejects assertions, including the scheduler's mutual-exclusion
+checks for those split writes. Pass `--default-pipeline` to reproduce the
+assertion rejection with the default XLS flags.
 
-The input can also be built starting from optimized proc IR:
+## Cycle comparison
 
-```bash
-bazelisk build //xls/experimental/stage_gfsim:schedule_proc
-bazel-bin/xls/experimental/stage_gfsim/schedule_proc \
-  --stages=3 --ii=1 --schedule_out=/tmp/design.schedule.textproto \
-  /tmp/design.opt.ir /tmp/design.scheduled.ir
-```
+XLS Codegen 1.5 lowers the same `scheduled.ir` to Block IR for the XLS
+interpreter. For each scenario, both simulators use the same input sequence,
+sink backpressure schedule, and depth-two external FIFOs. Workload cycles count
+from the first accepted source value through the last sink transfer, inclusive,
+after reset.
 
-The schedule helper defaults to XLS's synthetic `unit` delay model. A
-simulation's `--clock_period_ps` represents the period assumed for time
-estimates.
+| Scenario | GFSIM cycles | Block IR cycles |
+| --- | ---: | ---: |
+| Pipeline, steady | 22 | 22 |
+| Pipeline, backpressure | 33 | 33 |
+| Accumulator, steady | 93 | 93 |
+| Buffered pair, backpressure | 40 | 40 |
+| RISC-V, steady | 42 | 42 |
+| RISC-V, backpressure | 55 | 55 |
+| RISC-V long, steady | 1356 | 1356 |
+| RISC-V long, backpressure | 1483 | 1483 |
 
-## Cycle model
-
-- Stage 0 can start an activation when its inputs, state and output slot
-  allow it. Each subsequent stage reads the previous cycle's valid slot.
-  A stage claims space when the downstream slot is empty or its old value
-  advances this cycle.
-- A stage commits its enabled channel operations and state update on advance.
-  An update in a later stage makes the state unavailable from the advancing
-  read until the new value commits.
-- Streaming links are GFSIM queues with one producer and one consumer. Writes
-  become visible on the following cycle. A full queue at the beginning of a
-  cycle blocks writes for that cycle. External ports and channels without an
-  explicit depth have depth two.
-- The supported subset uses blocking receives, one send per stage, one
-  operation in each direction per channel in the network, and one unconditional
-  read and at most one write per state element. Internal queues start empty and
-  use positive depth with bypass disabled. FIFO port-register options and
-  codegen input/output flops are outside this stage model.
-
-The simulator writes TSV handshake events to stdout and counters to stderr.
-`source` and `sink` events show the stimulus and consumer at the external
-FIFOs. `receive` and `send` show each proc's own transfers. Cycle numbers start
-at one. To apply backpressure, use `--stall_output=_output --stall_first=6
---stall_last=16`. Workload cycles count from the first source event through
-the last sink event, inclusive. Estimated times are those cycle counts
-multiplied by the supplied clock period.
+All output values and transfer cycles match. The short and long RISC-V
+workloads also match on every input and output handshake. In the buffered pair,
+ten proc input handshakes occur one cycle later in GFSIM. GFSIM checks FIFO
+capacity at the start of the cycle. The Block IR internal FIFO can accept a
+push while full if a pop occurs that cycle.
