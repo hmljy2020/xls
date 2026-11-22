@@ -16,6 +16,7 @@
 #define XLS_EXPERIMENTAL_STAGE_GFSIM_MODEL_H_
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -32,7 +33,7 @@ class Package;
 
 namespace stage_gfsim {
 
-struct SimChannel;
+class SimChannel;
 using Channels = std::unordered_map<std::string_view, SimChannel*>;
 
 enum class Port { kInternal, kInput, kOutput };
@@ -41,6 +42,7 @@ struct ChannelSpec {
   std::string name;
   Port port;
   int depth;
+  std::unique_ptr<SimChannel> (*make_channel)();
 };
 
 struct ModelSpec {

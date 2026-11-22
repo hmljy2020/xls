@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <exception>
 #include <fstream>
 #include <iostream>
@@ -56,25 +56,26 @@ ABSL_FLAG(std::string, stall_output, "", "Output channel to stop draining.");
 ABSL_FLAG(int64_t, stall_first, 0, "First cycle of the output stall.");
 ABSL_FLAG(int64_t, stall_last, 0,
           "Last cycle of the output stall (inclusive).");
+ABSL_FLAG(bool, trace, true, "Print the channel transfer trace.");
+ABSL_FLAG(bool, simulation_time, false,
+          "Report the simulation loop time in ns.");
 
 namespace xls::stage_gfsim {
-namespace {
 
-using Queue = gfsim::SimQueue<Value>;
-
-void Transfer(uint64_t cycle, std::string_view kind, std::string_view instance,
-              const Queue& queue, const Value& value) {
-  std::cout << cycle << '\t' << kind << '\t' << instance << '\t' << queue.Name()
-            << '\t' << value.ToString() << '\n';
+void TraceTransfer(gfsim::SimModule& module, std::string_view kind,
+                   const gfsim::SimObj& queue, const Value& value) {
+  std::cout << module.GetSim()->Cycles() << '\t' << kind << '\t'
+            << module.Name() << '\t' << queue.Name() << '\t' << value.ToString()
+            << '\n';
 }
 
-}  // namespace
-
 ProcRuntime::ProcRuntime(gfsim::SimModule& module, Proc& ir,
-                         std::size_t stage_count)
+                         std::size_t stage_count, bool interpret)
     : module_(module), ir_(ir), stats_(stage_count) {
-  for (Node* node : ir.nodes()) {
-    nodes_.emplace(node->GetName(), node);
+  if (interpret) {
+    for (Node* node : ir.nodes()) {
+      nodes_.emplace(node->GetName(), node);
+    }
   }
 }
 
@@ -124,22 +125,29 @@ Value StageContext::Interpret(std::string_view name,
   return std::move(*result);
 }
 
-std::optional<Value> StageContext::Receive(const SimChannel& channel,
-                                           std::string_view node,
-                                           bool enabled) {
+std::optional<Value> StageContext::Receive(
+    const TypedChannel<ValueCodec>& channel, std::string_view node,
+    bool enabled) {
   if (!enabled) {
     return ZeroOfType(proc_.nodes_.at(std::string(node))->GetType());
   }
-  if (!channel.readable) {
-    ++proc_.stats_[index_].input;
-    return std::nullopt;
+  if (const Value* data = ReceiveData(channel)) {
+    return Value::Tuple({Value::Token(), *data});
   }
-  receives_.push_back(&channel);
-  return Value::Tuple({Value::Token(), channel.queue->Peek()});
+  return std::nullopt;
 }
 
-bool StageContext::Send(const SimChannel& channel, const Value& value,
-                        bool enabled) {
+bool StageContext::ReceiveReady(const SimChannel& channel) {
+  if (!channel.readable) {
+    ++proc_.stats_[index_].input;
+    return false;
+  }
+  receives_.push_back(&channel);
+  return true;
+}
+
+bool StageContext::ProposeSend(const SimChannel& channel, const void* data,
+                               bool enabled) {
   if (!enabled) {
     return true;
   }
@@ -147,7 +155,7 @@ bool StageContext::Send(const SimChannel& channel, const Value& value,
     ++proc_.stats_[index_].output;
     return false;
   }
-  send_ = SendEffect{&channel, value};
+  send_ = SendEffect{&channel, data};
   return true;
 }
 
@@ -160,15 +168,11 @@ bool StageContext::StateReady(bool available) {
 
 void StageContext::Finish() {
   gfsim::SimModule& module = proc_.module_;
-  const uint64_t cycle = module.GetSim()->Cycles();
   for (const SimChannel* channel : receives_) {
-    auto value = channel->queue->Read();
-    Transfer(cycle, "receive", module.Name(), *channel->queue, *value);
+    channel->Consume(module, "receive");
   }
   if (send_) {
-    const auto& [channel, value] = *send_;
-    channel->queue->Write(std::make_shared<Value>(value));
-    Transfer(cycle, "send", module.Name(), *channel->queue, value);
+    send_->channel->Produce(module, send_->data);
   }
   ++proc_.stats_[index_].fired;
   module.GetSim()->MarkProgress();
@@ -176,7 +180,7 @@ void StageContext::Finish() {
 
 namespace {
 
-using Stimuli = std::unordered_map<std::string, std::deque<Value>>;
+using Stimuli = std::unordered_map<std::string, std::vector<Value>>;
 
 absl::StatusOr<Stimuli> ReadInputs(const std::string& path,
                                    const ModelSpec& model) {
@@ -211,34 +215,35 @@ absl::StatusOr<Stimuli> ReadInputs(const std::string& path,
   return inputs;
 }
 
-class Network final : public gfsim::SimModule {
+class Network final : public ChannelOwner {
  public:
   Network(gfsim::SimSystem& system, const ModelSpec& model, Package& package,
-          Stimuli inputs)
-      : SimModule("stage_gfsim", &system),
+          const Stimuli& inputs, bool trace)
+      : ChannelOwner("stage_gfsim", &system),
         model_(model),
         package_(package),
-        stimuli_(std::move(inputs)),
-        channels_(model.channels.size()),
+        trace_(trace),
         stall_output_(absl::GetFlag(FLAGS_stall_output)),
         stall_first_(absl::GetFlag(FLAGS_stall_first)),
-        stall_last_(absl::GetFlag(FLAGS_stall_last)) {}
+        stall_last_(absl::GetFlag(FLAGS_stall_last)) {
+    for (const ChannelSpec& spec : model_.channels) {
+      auto channel = spec.make_channel();
+      if (spec.port == Port::kInput) {
+        for (const Value& input : inputs.at(spec.name)) {
+          channel->AddInput(input);
+        }
+      }
+      channels_.push_back(std::move(channel));
+    }
+  }
 
   void Build() override {
     SetObjectCapacity(model_.channels.size() + model_.proc_count);
     Channels channels_by_name;
     for (size_t i = 0; i < model_.channels.size(); ++i) {
       const ChannelSpec& spec = model_.channels[i];
-      auto queue = std::make_shared<Queue>(spec.name);
-      queue->InitMaxSize(spec.depth);
-      queue->Setlatency(1);
-      channels_[i].queue = AddInnerQueue(queue);
-      channels_by_name.emplace(spec.name, &channels_[i]);
-      if (spec.port == Port::kInput) {
-        BindOutput(queue.get());
-      } else if (spec.port == Port::kOutput) {
-        BindInput(queue.get());
-      }
+      channels_[i]->Build(*this, spec, trace_);
+      channels_by_name.emplace(spec.name, channels_[i].get());
     }
     absl::Status status = model_.build_procs(*this, package_, channels_by_name);
     if (!status.ok()) {
@@ -249,7 +254,9 @@ class Network final : public gfsim::SimModule {
   }
 
   void Reset() override {
-    pending_ = stimuli_;
+    for (const auto& channel : channels_) {
+      channel->ResetInputs();
+    }
     delivered_ = 0;
     first_source_.reset();
     last_sink_.reset();
@@ -259,34 +266,25 @@ class Network final : public gfsim::SimModule {
 
   void Work() override {
     // Take all FIFO admission decisions from the same cycle boundary.
-    for (SimChannel& channel : channels_) {
-      channel.readable = !channel.queue->Empty();
-      channel.writable = !channel.queue->Full();
+    for (const auto& channel : channels_) {
+      channel->Sample();
     }
     WorkChildren();
 
     const uint64_t cycle = GetSim()->Cycles();
     for (size_t i = 0; i < channels_.size(); ++i) {
       const ChannelSpec& spec = model_.channels[i];
-      SimChannel& channel = channels_[i];
-      if (spec.port == Port::kInput && channel.writable) {
-        auto& pending = pending_.at(spec.name);
-        if (!pending.empty()) {
-          auto value = std::make_shared<Value>(std::move(pending.front()));
-          Transfer(cycle, "source", Name(), *channel.queue, *value);
-          channel.queue->Write(std::move(value));
-          if (!first_source_) {
-            first_source_ = cycle;
-          }
-          pending.pop_front();
-          GetSim()->MarkProgress();
+      SimChannel& channel = *channels_[i];
+      if (spec.port == Port::kInput && channel.Source(*this)) {
+        if (!first_source_) {
+          first_source_ = cycle;
         }
+        GetSim()->MarkProgress();
       }
       if (spec.port == Port::kOutput && channel.readable &&
           !(spec.name == stall_output_ && cycle >= stall_first_ &&
             cycle <= stall_last_)) {
-        auto value = channel.queue->Read();
-        Transfer(cycle, "sink", Name(), *channel.queue, *value);
+        channel.Consume(*this, "sink");
         last_sink_ = cycle;
         ++delivered_;
         GetSim()->MarkProgress();
@@ -323,9 +321,8 @@ class Network final : public gfsim::SimModule {
  private:
   const ModelSpec& model_;
   Package& package_;
-  const Stimuli stimuli_;
-  Stimuli pending_;
-  std::vector<SimChannel> channels_;
+  std::vector<std::unique_ptr<SimChannel>> channels_;
+  bool trace_;
   std::string stall_output_;
   uint64_t stall_first_;
   uint64_t stall_last_;
@@ -349,12 +346,23 @@ absl::Status Simulate(std::string_view path, const ModelSpec& model) {
   gfsim::SimSystem system;
   system.SetDeadlockThreshold(0);
   system.GetReporter().SetOutput(std::cerr);
+  const bool trace = absl::GetFlag(FLAGS_trace);
   system.AddModule(
-      std::make_shared<Network>(system, model, *package, std::move(inputs)));
+      std::make_shared<Network>(system, model, *package, inputs, trace));
   system.Build();
-  std::cout << "cycle\tevent\tinstance\tchannel\tvalue\n";
+  if (trace) {
+    std::cout << "cycle\tevent\tinstance\tchannel\tvalue\n";
+  }
+  const auto start = std::chrono::steady_clock::now();
   for (int64_t cycle = 0; cycle < cycles; ++cycle) {
     system.Step();
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  if (absl::GetFlag(FLAGS_simulation_time)) {
+    std::cerr
+        << "simulation_ns="
+        << std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()
+        << '\n';
   }
   system.ReportStat();
   return absl::OkStatus();

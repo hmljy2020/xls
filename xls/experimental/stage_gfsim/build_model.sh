@@ -44,6 +44,7 @@ cc_binary(
     deps = [
         "//xls/common/status:status_macros",
         "//xls/experimental/stage_gfsim:model",
+        "//xls/experimental/stage_gfsim:native_value",
         "//xls/experimental/stage_gfsim/out:runtime",
         "//xls/ir",
         "//xls/ir:bits_ops",

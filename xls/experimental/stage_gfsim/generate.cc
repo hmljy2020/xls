@@ -34,6 +34,7 @@
 #include "xls/common/init_xls.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/experimental/stage_gfsim/model.h"
+#include "xls/experimental/stage_gfsim/native_expression.h"
 #include "xls/ir/channel.h"
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/name_uniquer.h"
@@ -45,6 +46,7 @@
 #include "xls/ir/proc_elaboration.h"
 #include "xls/ir/state_element.h"
 #include "xls/ir/topo_sort.h"
+#include "xls/ir/type.h"
 
 namespace xls::stage_gfsim {
 namespace {
@@ -70,9 +72,16 @@ struct InstanceDescription {
   std::vector<std::string> channels;
 };
 
+struct ChannelDescription {
+  std::string name;
+  Port port;
+  int depth;
+  const Type* type;
+};
+
 struct ModelDescription {
   std::vector<ProcDescription> procs;
-  std::vector<ChannelSpec> channels;
+  std::vector<ChannelDescription> channels;
   std::vector<InstanceDescription> instances;
 };
 
@@ -182,7 +191,8 @@ absl::StatusOr<ModelDescription> DescribeModel(Package& package) {
           absl::StrCat("Expected an empty, buffered channel: ", name));
     }
     channels.emplace(instance, model.channels.size());
-    model.channels.push_back({name, port, static_cast<int>(depth)});
+    model.channels.push_back(
+        {name, port, static_cast<int>(depth), channel->type()});
     producers.push_back(port == Port::kInput ? 1 : 0);
     consumers.push_back(port == Port::kOutput ? 1 : 0);
   }
@@ -228,7 +238,53 @@ std::string Quote(std::string_view string) {
                       "\"");
 }
 
-using Variables = std::unordered_map<const Node*, std::string>;
+const Type* PortType(const ChannelNode& port) {
+  if (port.Is<Send>()) {
+    return port.As<Send>()->data()->GetType();
+  }
+  return port.GetType()->AsTupleOrDie()->element_type(1);
+}
+
+std::string ChannelCodec(const Type* type, bool native) {
+  return native ? NativeCodec(type) : "ValueCodec";
+}
+
+std::string CppType(const Type* type, bool native) {
+  return native ? NativeCodec(type) + "::Type" : "Value";
+}
+
+bool SupportsNative(const ModelDescription& model) {
+  for (const ChannelDescription& channel : model.channels) {
+    if (NativeCodec(channel.type).empty()) {
+      return false;
+    }
+  }
+  for (const ProcDescription& proc : model.procs) {
+    if (!proc.HasWork()) {
+      continue;
+    }
+    Variables names;
+    for (const Node* node : proc.proc->nodes()) {
+      if (NativeCodec(node->GetType()).empty()) {
+        return false;
+      }
+      names.emplace(node, node->GetName());
+    }
+    for (const StateElement* state : proc.proc->StateElements()) {
+      if (NativeCodec(state->type()).empty()) {
+        return false;
+      }
+    }
+    for (const Node* node : proc.proc->nodes()) {
+      if (!(node->Is<Receive>() || node->Is<Send>() || node->Is<StateRead>() ||
+            node->Is<Next>()) &&
+          NativeExpression(*node, names).empty()) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 struct StageSlot {
   std::string type;
@@ -395,25 +451,63 @@ std::string DirectExpression(const Node& node, const Variables& names) {
   return absl::StrCat("Value(", expr, ")");
 }
 
-std::string PredicateArg(std::optional<Node*> predicate,
-                         const Variables& names) {
-  return predicate
-             ? absl::StrCat(", !", names.at(*predicate), ".bits().IsZero()")
-             : "";
+std::string Predicate(const Node* predicate, const Variables& names,
+                      bool native) {
+  const std::string& name = names.at(predicate);
+  return native ? name : "!" + name + ".bits().IsZero()";
+}
+
+void EmitNativeReceive(std::ostream& output, const Receive& receive,
+                       const Variables& names, const std::string& port,
+                       const std::string& pending) {
+  std::string predicate;
+  if (auto p = receive.predicate()) {
+    predicate = Predicate(*p, names, true);
+  }
+  output << "    const auto* " << pending << " = ";
+  if (!predicate.empty()) {
+    output << predicate << " ? ";
+  }
+  output << "stage.ReceiveData(" << port << "_)";
+  if (!predicate.empty()) {
+    output << " : nullptr";
+  }
+  output << ";\n"
+         << "    if (" << (predicate.empty() ? "" : predicate + " && ") << "!"
+         << pending << ") {\n"
+         << "      return;\n"
+         << "    }\n"
+         << "    const " << CppType(receive.GetType(), true) << " "
+         << names.at(&receive) << "{NativeToken::Type{}, ";
+  if (predicate.empty()) {
+    output << "*" << pending;
+  } else {
+    output << pending << " ? *" << pending << " : "
+           << CppType(PortType(receive), true) << "{}";
+  }
+  output << "};\n";
 }
 
 void EmitNode(std::ostream& output, const Node& node, const Variables& names,
-              const Variables& ports, const States& states,
-              NameUniquer& unique) {
+              const Variables& ports, const States& states, NameUniquer& unique,
+              bool native) {
   const std::string& name = names.at(&node);
   const char* attribute = node.GetType()->IsToken() || node.users().empty()
                               ? "[[maybe_unused]] "
                               : "";
   if (node.Is<Receive>()) {
     const std::string pending = unique.GetSanitizedUniqueName(name + "_result");
+    if (native) {
+      EmitNativeReceive(output, *node.As<Receive>(), names, ports.at(&node),
+                        pending);
+      return;
+    }
     output << "    const auto " << pending << " = stage.Receive("
-           << ports.at(&node) << "_, " << Quote(node.GetName())
-           << PredicateArg(node.As<Receive>()->predicate(), names) << ");\n"
+           << ports.at(&node) << "_, " << Quote(node.GetName());
+    if (auto predicate = node.As<Receive>()->predicate()) {
+      output << ", " << Predicate(*predicate, names, native);
+    }
+    output << ");\n"
            << "    if (!" << pending << ".has_value()) {\n"
            << "      return;\n"
            << "    }\n"
@@ -428,42 +522,48 @@ void EmitNode(std::ostream& output, const Node& node, const Variables& names,
              << "      return;\n"
              << "    }\n";
     }
-    output << "    " << attribute << "const Value& " << name << " = "
+    output << "    " << attribute << "const auto& " << name << " = "
            << state.value << ";\n";
     return;
   }
   if (node.Is<Send>()) {
     const Send* send = node.As<Send>();
     output << "    if (!stage.Send(" << ports.at(&node) << "_, "
-           << names.at(send->data()) << PredicateArg(send->predicate(), names)
-           << ")) {\n"
+           << names.at(send->data());
+    if (auto predicate = send->predicate()) {
+      output << ", " << Predicate(*predicate, names, native);
+    }
+    output << ")) {\n"
            << "      return;\n"
            << "    }\n";
     if (!node.users().empty()) {
-      output << "    " << attribute << "const Value " << name
-             << " = Value::Token();\n";
+      output << "    " << attribute << "const auto " << name << " = "
+             << (native ? "NativeToken::Type{}" : "Value::Token()") << ";\n";
     }
     return;
   }
   if (node.Is<Next>()) {
     if (!node.users().empty()) {
-      output << "    " << attribute << "const Value " << name
-             << " = Value::Tuple({});\n";
+      output << "    " << attribute << "const auto " << name << " = "
+             << (native ? "NativeTuple<>::Type{}" : "Value::Tuple({})")
+             << ";\n";
     }
     return;
   }
 
-  std::string expr = DirectExpression(node, names);
+  std::string expr =
+      native ? NativeExpression(node, names) : DirectExpression(node, names);
   if (expr.empty()) {
     expr = absl::StrCat("stage.Interpret(", Quote(node.GetName()), ", {",
                         Operands(node, names), "})");
   }
-  output << "    " << attribute << "const Value " << name << " = " << expr
+  output << "    " << attribute << "const auto " << name << " = " << expr
          << ";\n";
 }
 
 void EmitStateProposals(std::ostream& output, const StageDescription& stage,
-                        const States& states, const Variables& names) {
+                        const States& states, const Variables& names,
+                        bool native) {
   for (const Node* node : stage.nodes) {
     if (node->Is<StateRead>()) {
       const StateMembers& state =
@@ -477,7 +577,7 @@ void EmitStateProposals(std::ostream& output, const StageDescription& stage,
       const std::string assignment =
           absl::StrCat(state.Pending(), " = ", names.at(next->value()), ";\n");
       if (auto predicate = next->predicate()) {
-        output << "    if (!" << names.at(*predicate) << ".bits().IsZero()) {\n"
+        output << "    if (" << Predicate(*predicate, names, native) << ") {\n"
                << "      " << assignment << "    }\n";
       } else {
         output << "    " << assignment;
@@ -491,7 +591,7 @@ void EmitStateProposals(std::ostream& output, const StageDescription& stage,
 
 void EmitStage(std::ostream& output, const StageDescription& stage,
                size_t index, const std::vector<StageSlot>& slots,
-               const Variables& ports, const States& states) {
+               const Variables& ports, const States& states, bool native) {
   const StageSlot* input = index == 0 ? nullptr : &slots[index - 1];
   const StageSlot* next = index == slots.size() ? nullptr : &slots[index];
   const std::string input_valid =
@@ -516,10 +616,12 @@ void EmitStage(std::ostream& output, const StageDescription& stage,
     names.emplace(node, name);
     output << (node->GetType()->IsToken() ? "    [[maybe_unused]] " : "    ");
     if (node->Is<Literal>()) {
-      output << "const Value " << name << " = "
-             << LiteralExpression(*node->As<Literal>()) << ";\n";
+      output << "const auto " << name << " = "
+             << (native ? NativeExpression(*node, names)
+                        : LiteralExpression(*node->As<Literal>()))
+             << ";\n";
     } else {
-      output << "const Value& " << name << " = " << input->member << "->"
+      output << "const auto& " << name << " = " << input->member << "->"
              << input->fields.at(node) << ";\n";
     }
   };
@@ -533,10 +635,10 @@ void EmitStage(std::ostream& output, const StageDescription& stage,
   }
   for (const Node* node : stage.nodes) {
     names.emplace(node, CppName(unique, "v_", node->GetName()));
-    EmitNode(output, *node, names, ports, states, unique);
+    EmitNode(output, *node, names, ports, states, unique, native);
   }
   output << "    stage.Finish();\n";
-  EmitStateProposals(output, stage, states, names);
+  EmitStateProposals(output, stage, states, names, native);
   if (input) {
     output << "    " << input->Consumed() << " = true;\n";
   }
@@ -556,7 +658,8 @@ void EmitStage(std::ostream& output, const StageDescription& stage,
 }
 
 void EmitReset(std::ostream& output, const Proc& proc,
-               const std::vector<StageSlot>& slots, const States& states) {
+               const std::vector<StageSlot>& slots, const States& states,
+               bool native) {
   output << "  void Reset() override {\n"
          << "    proc_.Reset();\n";
   for (const StageSlot& slot : slots) {
@@ -566,8 +669,12 @@ void EmitReset(std::ostream& output, const Proc& proc,
   }
   for (const StateElement* element : proc.StateElements()) {
     const StateMembers& state = states.at(element);
-    output << "    " << state.value << " = proc_.InitialState("
-           << Quote(element->name()) << ");\n";
+    output << "    " << state.value << " = ";
+    if (native) {
+      output << NativeCodec(element->type()) << "::FromValue(";
+    }
+    output << "proc_.InitialState(" << Quote(element->name())
+           << (native ? ")" : "") << ");\n";
     if (state.has_write) {
       output << "    " << state.Pending() << ".reset();\n";
     }
@@ -608,7 +715,7 @@ void EmitXfer(std::ostream& output, const Proc& proc,
 }
 
 void EmitProc(std::ostream& output, const ProcDescription& proc,
-              std::string_view name) {
+              std::string_view name, bool native) {
   NameUniquer unique("_");
   std::vector<StageSlot> slots;
   for (size_t i = 1; i < proc.stages.size(); ++i) {
@@ -645,11 +752,12 @@ void EmitProc(std::ostream& output, const ProcDescription& proc,
     const std::string param = CppName(unique, port->Is<Send>() ? "out_" : "in_",
                                       port->channel_name());
     ports.emplace(port, param);
-    output << ",\n      const SimChannel& " << param;
+    output << ",\n      const TypedChannel<"
+           << ChannelCodec(PortType(*port), native) << ">& " << param;
   }
   output << ")\n"
          << "      : SimModule(std::move(name)), proc_(*this, ir, "
-         << proc.stages.size() << ")";
+         << proc.stages.size() << ", " << (native ? "false" : "true") << ")";
   for (const ChannelNode* port : proc.ports) {
     const std::string& param = ports.at(port);
     output << ",\n        " << param << "_(" << param << ")";
@@ -657,11 +765,11 @@ void EmitProc(std::ostream& output, const ProcDescription& proc,
   output << " {\n";
   for (const ChannelNode* port : proc.ports) {
     output << "    " << (port->Is<Send>() ? "BindOutput" : "BindInput") << "("
-           << ports.at(port) << "_.queue);\n";
+           << ports.at(port) << "_.queue());\n";
   }
   output << "  }\n\n"
          << "  void Build() override { SetObjectCapacity(0); }\n\n";
-  EmitReset(output, *proc.proc, slots, states);
+  EmitReset(output, *proc.proc, slots, states, native);
   output << "  void Work() override {\n"
          << "    // Run downstream first so an upstream stage can refill a "
             "freed slot.\n";
@@ -676,7 +784,8 @@ void EmitProc(std::ostream& output, const ProcDescription& proc,
     const StageSlot& slot = slots[i];
     output << "  struct " << slot.type << " {\n";
     for (const Node* node : proc.stages[i].live_out) {
-      output << "    Value " << slot.fields.at(node) << ";\n";
+      output << "    " << CppType(node->GetType(), native) << " "
+             << slot.fields.at(node) << ";\n";
     }
     output << "  };\n"
            << "  std::optional<" << slot.type << "> " << slot.member << ";\n"
@@ -685,9 +794,10 @@ void EmitProc(std::ostream& output, const ProcDescription& proc,
   }
   for (const StateElement* element : proc.proc->StateElements()) {
     const StateMembers& state = states.at(element);
-    output << "  Value " << state.value << ";\n";
+    const std::string type = CppType(element->type(), native);
+    output << "  " << type << " " << state.value << ";\n";
     if (state.has_write) {
-      output << "  std::optional<Value> " << state.Pending() << ";\n";
+      output << "  std::optional<" << type << "> " << state.Pending() << ";\n";
     }
     if (state.has_feedback) {
       output << "  bool " << state.Available() << " = true;\n"
@@ -696,16 +806,17 @@ void EmitProc(std::ostream& output, const ProcDescription& proc,
     output << "\n";
   }
   for (size_t i = 0; i < proc.stages.size(); ++i) {
-    EmitStage(output, proc.stages[i], i, slots, ports, states);
+    EmitStage(output, proc.stages[i], i, slots, ports, states, native);
   }
   output << "  ProcRuntime proc_;\n";
   for (const ChannelNode* port : proc.ports) {
-    output << "  const SimChannel& " << ports.at(port) << "_;\n";
+    output << "  const TypedChannel<" << ChannelCodec(PortType(*port), native)
+           << ">& " << ports.at(port) << "_;\n";
   }
   output << "};\n\n";
 }
 
-std::string EmitModel(const ModelDescription& model) {
+std::string EmitModel(const ModelDescription& model, bool native) {
   std::ostringstream output;
   output << "// Generated from XLS scheduled_proc IR.\n"
          << "#include <memory>\n"
@@ -715,6 +826,7 @@ std::string EmitModel(const ModelDescription& model) {
          << "#include \"absl/status/status.h\"\n"
          << "#include \"xls/common/status/status_macros.h\"\n"
          << "#include \"xls/experimental/stage_gfsim/model.h\"\n"
+         << "#include \"xls/experimental/stage_gfsim/native_value.h\"\n"
          << "#include \"xls/experimental/stage_gfsim/proc_runtime.h\"\n"
          << "#include \"xls/ir/bits_ops.h\"\n"
          << "#include \"xls/ir/package.h\"\n\n"
@@ -728,7 +840,7 @@ std::string EmitModel(const ModelDescription& model) {
     if (proc.HasWork()) {
       classes[i] = CppName(unique, "Proc_", proc.proc->name());
       ir_names[i] = CppName(unique, "ir_", proc.proc->name());
-      EmitProc(output, proc, classes[i]);
+      EmitProc(output, proc, classes[i], native);
     }
   }
   output << "absl::Status BuildProcs(gfsim::SimModule& network, Package& "
@@ -745,14 +857,17 @@ std::string EmitModel(const ModelDescription& model) {
     output << "  network.AddSubmodule(std::make_shared<"
            << classes[instance.proc] << ">(\n      " << Quote(instance.name)
            << ",\n      *" << ir_names[instance.proc];
-    for (const std::string& channel : instance.channels) {
-      output << ",\n      *channels.at(" << Quote(channel) << ")";
+    for (size_t i = 0; i < instance.channels.size(); ++i) {
+      const ChannelNode* port = model.procs[instance.proc].ports[i];
+      output << ",\n      static_cast<const TypedChannel<"
+             << ChannelCodec(PortType(*port), native) << ">&>(*channels.at("
+             << Quote(instance.channels[i]) << "))";
     }
     output << "));\n";
   }
   output << "  return absl::OkStatus();\n}\n\n"
          << "const ModelSpec kModel{\n    .channels = {\n";
-  for (const ChannelSpec& channel : model.channels) {
+  for (const ChannelDescription& channel : model.channels) {
     const char* port = "kInternal";
     if (channel.port == Port::kInput) {
       port = "kInput";
@@ -761,6 +876,8 @@ std::string EmitModel(const ModelDescription& model) {
     }
     output << "        {.name = " << Quote(channel.name)
            << ", .port = Port::" << port << ", .depth = " << channel.depth
+           << ", .make_channel = MakeChannel<"
+           << ChannelCodec(channel.type, native) << ">"
            << "},\n";
   }
   output << "    },\n    .proc_count = " << model.instances.size()
@@ -778,7 +895,7 @@ absl::Status Generate(std::string_view input, std::string_view output) {
   XLS_ASSIGN_OR_RETURN(std::unique_ptr<Package> package,
                        Parser::ParsePackage(text, input));
   XLS_ASSIGN_OR_RETURN(ModelDescription model, DescribeModel(*package));
-  return SetFileContents(output, EmitModel(model));
+  return SetFileContents(output, EmitModel(model, SupportsNative(model)));
 }
 
 }  // namespace

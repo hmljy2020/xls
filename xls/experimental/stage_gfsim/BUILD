@@ -20,6 +20,16 @@ package(default_applicable_licenses = ["//:license"])
 exports_files(["proc_runtime.h", "runtime.cc"])
 
 cc_library(
+    name = "native_value",
+    hdrs = ["native_value.h"],
+    visibility = ["//xls/experimental/stage_gfsim:__subpackages__"],
+    deps = [
+        "//xls/ir:bits",
+        "//xls/ir:value",
+    ],
+)
+
+cc_library(
     name = "model",
     hdrs = ["model.h"],
     visibility = ["//xls/experimental/stage_gfsim:__subpackages__"],
@@ -48,7 +58,7 @@ cc_binary(
 
 cc_binary(
     name = "generate",
-    srcs = ["generate.cc"],
+    srcs = ["generate.cc", "native_expression.cc", "native_expression.h"],
     deps = [
         ":model",
         "//xls/common:exit_status",
@@ -62,6 +72,7 @@ cc_binary(
         "//xls/ir:op",
         "//xls/ir:proc_elaboration",
         "//xls/ir:state_element",
+        "//xls/ir:type",
         "//xls/ir:value",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/status:statusor",

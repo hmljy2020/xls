@@ -41,6 +41,7 @@ cc_library(
         "//xls/ir:state_element",
         "//xls/ir:value",
         "//xls/ir:value_utils",
+        "@abseil-cpp//absl/container:inlined_vector",
         "@abseil-cpp//absl/flags:flag",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/status:statusor",
