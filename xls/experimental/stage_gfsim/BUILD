@@ -17,18 +17,13 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
 package(default_applicable_licenses = ["//:license"])
 
-exports_files(["pipeline.h", "runtime.cc"])
+exports_files(["pipeline.h", "proc_runtime.h", "runtime.cc"])
 
 cc_library(
     name = "model",
     hdrs = ["model.h"],
     visibility = ["//xls/experimental/stage_gfsim:__subpackages__"],
-    deps = [
-        "//xls/ir:value",
-        "@abseil-cpp//absl/status",
-        "@abseil-cpp//absl/status:statusor",
-        "@abseil-cpp//absl/types:span",
-    ],
+    deps = ["@abseil-cpp//absl/status"],
 )
 
 cc_binary(

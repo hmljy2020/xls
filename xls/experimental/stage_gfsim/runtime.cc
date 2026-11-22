@@ -25,7 +25,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -38,7 +37,7 @@
 #include "xls/common/init_xls.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/experimental/stage_gfsim/model.h"
-#include "xls/experimental/stage_gfsim/pipeline.h"
+#include "xls/experimental/stage_gfsim/proc_runtime.h"
 #include "xls/interpreter/ir_interpreter.h"
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/node.h"
@@ -62,156 +61,6 @@ namespace xls::stage_gfsim {
 namespace {
 
 using Queue = gfsim::SimQueue<Value>;
-using Values = std::unordered_map<std::string_view, Value>;
-
-struct Channel {
-  Queue* queue = nullptr;
-  bool readable = false;
-  bool writable = false;
-};
-
-using ChannelBindings = std::unordered_map<std::string_view, Channel*>;
-
-struct ProcPlan {
-  Proc* proc;
-  std::vector<StageFunction> stages;
-  std::unordered_map<std::string, Node*> nodes;
-  std::unordered_set<const StateElement*> feedback;
-};
-
-using ProcPlans = std::unordered_map<std::string_view, ProcPlan>;
-
-absl::StatusOr<ProcPlan> ResolveProc(Package& package, const ProcSpec& spec) {
-  XLS_ASSIGN_OR_RETURN(Proc * proc, package.GetProc(spec.name));
-  ProcPlan plan{
-      .proc = proc, .stages = spec.stages, .nodes = {}, .feedback = {}};
-  for (Node* node : proc->nodes()) {
-    plan.nodes.emplace(node->GetName(), node);
-  }
-  for (Next* write : proc->next_values()) {
-    XLS_ASSIGN_OR_RETURN(int64_t write_stage, proc->GetStageIndex(write));
-    for (StateRead* read :
-         proc->GetStateReadsByStateElement(write->state_element())) {
-      XLS_ASSIGN_OR_RETURN(int64_t read_stage, proc->GetStageIndex(read));
-      if (read_stage < write_stage) {
-        plan.feedback.insert(write->state_element());
-      }
-    }
-  }
-  return plan;
-}
-
-enum class Stall { kNone, kInput, kOutput, kState };
-
-struct StageStats {
-  uint64_t fired = 0;
-  uint64_t input = 0;
-  uint64_t output = 0;
-  uint64_t state = 0;
-};
-
-struct State {
-  Value value;
-  bool available = true;
-};
-
-struct Effects {
-  struct Send {
-    Channel* channel;
-    Value value;
-  };
-  struct Write {
-    const StateElement* element;
-    std::optional<Value> value;
-  };
-  std::vector<Channel*> receives;
-  std::optional<Send> send;
-  std::vector<const StateElement*> reads;
-  std::vector<Write> writes;
-};
-
-using StateValues = std::unordered_map<const StateElement*, State>;
-
-}  // namespace
-
-struct StageContext::Data {
-  const ProcPlan& plan;
-  const Values& inputs;
-  const ChannelBindings& channels;
-  const StateValues& state;
-  Values outputs;
-  Effects effects;
-  Stall stall = Stall::kNone;
-};
-
-const Value& StageContext::Input(std::string_view name) const {
-  return data_.inputs.at(name);
-}
-
-const Value& StageContext::Literal(std::string_view name) const {
-  return data_.plan.nodes.at(std::string(name))->As<xls::Literal>()->value();
-}
-
-absl::StatusOr<Value> StageContext::Interpret(
-    std::string_view name, absl::Span<const Value> operands) const {
-  return InterpretNode(data_.plan.nodes.at(std::string(name)), operands);
-}
-
-std::optional<Value> StageContext::Receive(std::string_view node,
-                                           bool enabled) {
-  if (!enabled) {
-    return ZeroOfType(data_.plan.nodes.at(std::string(node))->GetType());
-  }
-  Channel* channel = data_.channels.at(node);
-  if (!channel->readable) {
-    data_.stall = Stall::kInput;
-    return std::nullopt;
-  }
-  data_.effects.receives.push_back(channel);
-  return Value::Tuple({Value::Token(), channel->queue->Peek()});
-}
-
-bool StageContext::Send(std::string_view node, const Value& value,
-                        bool enabled) {
-  if (!enabled) {
-    return true;
-  }
-  Channel* channel = data_.channels.at(node);
-  if (!channel->writable) {
-    data_.stall = Stall::kOutput;
-    return false;
-  }
-  data_.effects.send = Effects::Send{channel, value};
-  return true;
-}
-
-const Value* StageContext::ReadState(std::string_view element) {
-  const StateElement* key =
-      data_.plan.proc->GetStateElementByName(element).value();
-  const State& state = data_.state.at(key);
-  if (!state.available) {
-    data_.stall = Stall::kState;
-    return nullptr;
-  }
-  if (data_.plan.feedback.contains(key)) {
-    data_.effects.reads.push_back(key);
-  }
-  return &state.value;
-}
-
-void StageContext::WriteState(std::string_view element, const Value& value,
-                              bool enabled) {
-  const StateElement* key =
-      data_.plan.proc->GetStateElementByName(element).value();
-  data_.effects.writes.push_back(
-      {key, enabled ? std::optional<Value>(value) : std::nullopt});
-}
-
-void StageContext::Forward(std::string_view name, Value value) {
-  data_.outputs.emplace(name, std::move(value));
-}
-
-namespace {
 
 void Transfer(uint64_t cycle, std::string_view kind, std::string_view instance,
               const Queue& queue, const Value& value) {
@@ -219,131 +68,157 @@ void Transfer(uint64_t cycle, std::string_view kind, std::string_view instance,
             << '\t' << value.ToString() << '\n';
 }
 
-class ProcModule final : public gfsim::SimModule {
- public:
-  ProcModule(const InstanceSpec& spec, const ProcPlan& plan,
-             const ChannelBindings& channels)
-      : SimModule(spec.name), plan_(plan), pipeline_(plan.stages.size()) {
-    for (const Binding& binding : spec.bindings) {
-      Channel* channel = channels.at(binding.channel);
-      Node* operation = plan.nodes.at(binding.node);
-      channel_for_node_.emplace(binding.node, channel);
-      if (operation->Is<Send>()) {
-        BindOutput(channel->queue);
-      } else {
-        BindInput(channel->queue);
+}  // namespace
+
+ProcRuntime::ProcRuntime(gfsim::SimModule& module, Proc& ir,
+                         std::size_t stage_count)
+    : module_(module), ir_(ir), stats_(stage_count) {
+  for (Node* node : ir.nodes()) {
+    nodes_.emplace(node->GetName(), node);
+  }
+  for (Next* write : ir.next_values()) {
+    const int64_t write_stage = ir.GetStageIndex(write).value();
+    for (StateRead* read :
+         ir.GetStateReadsByStateElement(write->state_element())) {
+      if (ir.GetStageIndex(read).value() < write_stage) {
+        feedback_.insert(write->state_element());
       }
     }
   }
+}
 
-  void Build() override { SetObjectCapacity(0); }
-
-  void Reset() override {
-    state_.clear();
-    for (StateElement* element : plan_.proc->StateElements()) {
-      state_.emplace(element, State{element->initial_value()});
-    }
-    pipeline_.Reset();
-    stats_.assign(plan_.stages.size(), {});
+void ProcRuntime::Reset() {
+  state_.clear();
+  for (StateElement* element : ir_.StateElements()) {
+    state_.emplace(element, State{element->initial_value()});
   }
+  stats_.assign(stats_.size(), {});
+}
 
-  void Work() override {
-    pipeline_.BeginCycle();
-    next_state_ = state_;
-    for (size_t i = plan_.stages.size(); i-- > 0;) {
-      StageStats& stats = stats_[i];
-      if (!pipeline_.InputValid(i)) {
-        ++stats.input;
-        continue;
-      }
-      if (!pipeline_.OutputReady(i)) {
-        ++stats.output;
-        continue;
-      }
-
-      const Values empty;
-      StageContext::Data data{
-          .plan = plan_,
-          .inputs = i == 0 ? empty : pipeline_.Input(i),
-          .channels = channel_for_node_,
-          .state = state_,
-          .outputs = {},
-          .effects = {},
-      };
-      StageContext stage(data);
-      absl::Status status = plan_.stages[i](stage);
-      if (!status.ok()) {
-        throw std::runtime_error(Name() + " stage " + std::to_string(i) + ": " +
-                                 status.ToString());
-      }
-      switch (data.stall) {
-        case Stall::kInput:
-          ++stats.input;
-          continue;
-        case Stall::kOutput:
-          ++stats.output;
-          continue;
-        case Stall::kState:
-          ++stats.state;
-          continue;
-        case Stall::kNone:
-          break;
-      }
-
-      Commit(data.effects);
-      pipeline_.Advance(i, std::move(data.outputs));
-      ++stats.fired;
-      GetSim()->MarkProgress();
-    }
+bool ProcRuntime::StageReady(std::size_t index, bool input_valid,
+                             bool output_ready) {
+  if (!input_valid) {
+    ++stats_[index].input;
+    return false;
   }
-
-  void Xfer() override {
-    pipeline_.EndCycle();
-    state_.swap(next_state_);
+  if (!output_ready) {
+    ++stats_[index].output;
+    return false;
   }
+  return true;
+}
 
-  void ReportStat() override {
-    for (size_t i = 0; i < stats_.size(); ++i) {
-      const StageStats& stage = stats_[i];
-      const std::string name = Name() + ".stage_" + std::to_string(i);
-      Report().ReportVal(name + ".fire_cycles", stage.fired);
-      Report().ReportVal(name + ".input_stall_cycles", stage.input);
-      Report().ReportVal(name + ".output_stall_cycles", stage.output);
-      Report().ReportVal(name + ".state_stall_cycles", stage.state);
-    }
+void ProcRuntime::ReportStat(gfsim::Reporter& report) const {
+  for (std::size_t i = 0; i < stats_.size(); ++i) {
+    const StageStats& stage = stats_[i];
+    const std::string name = module_.Name() + ".stage_" + std::to_string(i);
+    report.ReportVal(name + ".fire_cycles", stage.fired);
+    report.ReportVal(name + ".input_stall_cycles", stage.input);
+    report.ReportVal(name + ".output_stall_cycles", stage.output);
+    report.ReportVal(name + ".state_stall_cycles", stage.state);
   }
+}
 
- private:
-  void Commit(const Effects& effects) {
-    const uint64_t cycle = GetSim()->Cycles();
-    for (Channel* channel : effects.receives) {
-      auto value = channel->queue->Read();
-      Transfer(cycle, "receive", Name(), *channel->queue, *value);
-    }
-    if (effects.send) {
-      const auto& [channel, value] = *effects.send;
-      channel->queue->Write(std::make_shared<Value>(value));
-      Transfer(cycle, "send", Name(), *channel->queue, value);
-    }
-    for (const StateElement* element : effects.reads) {
-      next_state_.at(element).available = false;
-    }
-    for (const auto& [element, value] : effects.writes) {
-      State& state = next_state_.at(element);
-      if (value) {
-        state.value = *value;
-      }
-      state.available = true;
-    }
+const Value& StageContext::Input(std::string_view name) const {
+  return pipeline_.Input(index_).at(name);
+}
+
+const Value& StageContext::Literal(std::string_view name) const {
+  return proc_.nodes_.at(std::string(name))->As<xls::Literal>()->value();
+}
+
+Value StageContext::Interpret(std::string_view name,
+                              absl::Span<const Value> operands) const {
+  absl::StatusOr<Value> result =
+      InterpretNode(proc_.nodes_.at(std::string(name)), operands);
+  if (!result.ok()) {
+    throw std::runtime_error(proc_.module_.Name() + " stage " +
+                             std::to_string(index_) + ": " +
+                             result.status().ToString());
   }
+  return std::move(*result);
+}
 
-  const ProcPlan& plan_;
-  ChannelBindings channel_for_node_;
-  Pipeline<Values> pipeline_;
-  StateValues state_;
-  StateValues next_state_;
-  std::vector<StageStats> stats_;
-};
+std::optional<Value> StageContext::Receive(const SimChannel& channel,
+                                           std::string_view node,
+                                           bool enabled) {
+  if (!enabled) {
+    return ZeroOfType(proc_.nodes_.at(std::string(node))->GetType());
+  }
+  if (!channel.readable) {
+    ++proc_.stats_[index_].input;
+    return std::nullopt;
+  }
+  receives_.push_back(&channel);
+  return Value::Tuple({Value::Token(), channel.queue->Peek()});
+}
+
+bool StageContext::Send(const SimChannel& channel, const Value& value,
+                        bool enabled) {
+  if (!enabled) {
+    return true;
+  }
+  if (!channel.writable) {
+    ++proc_.stats_[index_].output;
+    return false;
+  }
+  send_ = SendEffect{&channel, value};
+  return true;
+}
+
+absl::optional_ref<const Value> StageContext::ReadState(
+    std::string_view element) {
+  const StateElement* key = proc_.ir_.GetStateElementByName(element).value();
+  const ProcRuntime::State& state = proc_.state_.at(key);
+  if (!state.available) {
+    ++proc_.stats_[index_].state;
+    return std::nullopt;
+  }
+  if (proc_.feedback_.contains(key)) {
+    reads_.push_back(key);
+  }
+  return state.value;
+}
+
+void StageContext::WriteState(std::string_view element, const Value& value,
+                              bool enabled) {
+  const StateElement* key = proc_.ir_.GetStateElementByName(element).value();
+  writes_.push_back(
+      {key, enabled ? std::optional<Value>(value) : std::nullopt});
+}
+
+void StageContext::Forward(std::string_view name, Value value) {
+  outputs_.emplace(name, std::move(value));
+}
+
+StageValues StageContext::Commit() {
+  gfsim::SimModule& module = proc_.module_;
+  const uint64_t cycle = module.GetSim()->Cycles();
+  for (const SimChannel* channel : receives_) {
+    auto value = channel->queue->Read();
+    Transfer(cycle, "receive", module.Name(), *channel->queue, *value);
+  }
+  if (send_) {
+    const auto& [channel, value] = *send_;
+    channel->queue->Write(std::make_shared<Value>(value));
+    Transfer(cycle, "send", module.Name(), *channel->queue, value);
+  }
+  for (const StateElement* element : reads_) {
+    proc_.next_state_.at(element).available = false;
+  }
+  for (const auto& [element, value] : writes_) {
+    ProcRuntime::State& state = proc_.next_state_.at(element);
+    if (value) {
+      state.value = *value;
+    }
+    state.available = true;
+  }
+  ++proc_.stats_[index_].fired;
+  module.GetSim()->MarkProgress();
+  return std::move(outputs_);
+}
+
+namespace {
 
 using Stimuli = std::unordered_map<std::string, std::deque<Value>>;
 
@@ -382,11 +257,11 @@ absl::StatusOr<Stimuli> ReadInputs(const std::string& path,
 
 class Network final : public gfsim::SimModule {
  public:
-  Network(gfsim::SimSystem& system, const ModelSpec& model,
-          const ProcPlans& plans, Stimuli inputs)
+  Network(gfsim::SimSystem& system, const ModelSpec& model, Package& package,
+          Stimuli inputs)
       : SimModule("stage_gfsim", &system),
         model_(model),
-        plans_(plans),
+        package_(package),
         stimuli_(std::move(inputs)),
         channels_(model.channels.size()),
         stall_output_(absl::GetFlag(FLAGS_stall_output)),
@@ -394,8 +269,8 @@ class Network final : public gfsim::SimModule {
         stall_last_(absl::GetFlag(FLAGS_stall_last)) {}
 
   void Build() override {
-    SetObjectCapacity(model_.channels.size() + model_.instances.size());
-    ChannelBindings channels_by_name;
+    SetObjectCapacity(model_.channels.size() + model_.proc_count);
+    Channels channels_by_name;
     for (size_t i = 0; i < model_.channels.size(); ++i) {
       const ChannelSpec& spec = model_.channels[i];
       auto queue = std::make_shared<Queue>(spec.name);
@@ -409,9 +284,9 @@ class Network final : public gfsim::SimModule {
         BindInput(queue.get());
       }
     }
-    for (const InstanceSpec& spec : model_.instances) {
-      AddSubmodule(std::make_shared<ProcModule>(spec, plans_.at(spec.proc),
-                                                channels_by_name));
+    absl::Status status = model_.build_procs(*this, package_, channels_by_name);
+    if (!status.ok()) {
+      throw std::runtime_error(status.ToString());
     }
     BuildInnerQueues();
     BuildChildren();
@@ -428,7 +303,7 @@ class Network final : public gfsim::SimModule {
 
   void Work() override {
     // Take all FIFO admission decisions from the same cycle boundary.
-    for (Channel& channel : channels_) {
+    for (SimChannel& channel : channels_) {
       channel.readable = !channel.queue->Empty();
       channel.writable = !channel.queue->Full();
     }
@@ -437,7 +312,7 @@ class Network final : public gfsim::SimModule {
     const uint64_t cycle = GetSim()->Cycles();
     for (size_t i = 0; i < channels_.size(); ++i) {
       const ChannelSpec& spec = model_.channels[i];
-      Channel& channel = channels_[i];
+      SimChannel& channel = channels_[i];
       if (spec.port == Port::kInput && channel.writable) {
         auto& pending = pending_.at(spec.name);
         if (!pending.empty()) {
@@ -491,10 +366,10 @@ class Network final : public gfsim::SimModule {
 
  private:
   const ModelSpec& model_;
-  const ProcPlans& plans_;
+  Package& package_;
   const Stimuli stimuli_;
   Stimuli pending_;
-  std::vector<Channel> channels_;
+  std::vector<SimChannel> channels_;
   std::string stall_output_;
   uint64_t stall_first_;
   uint64_t stall_last_;
@@ -513,19 +388,13 @@ absl::Status Simulate(std::string_view path, const ModelSpec& model) {
   XLS_ASSIGN_OR_RETURN(std::string text, GetFileContents(path));
   XLS_ASSIGN_OR_RETURN(std::unique_ptr<Package> package,
                        Parser::ParsePackage(text, path));
-  ProcPlans plans;
-  plans.reserve(model.procs.size());
-  for (const ProcSpec& spec : model.procs) {
-    XLS_ASSIGN_OR_RETURN(ProcPlan plan, ResolveProc(*package, spec));
-    plans.emplace(spec.name, std::move(plan));
-  }
   XLS_ASSIGN_OR_RETURN(Stimuli inputs,
                        ReadInputs(absl::GetFlag(FLAGS_inputs), model));
   gfsim::SimSystem system;
   system.SetDeadlockThreshold(0);
   system.GetReporter().SetOutput(std::cerr);
   system.AddModule(
-      std::make_shared<Network>(system, model, plans, std::move(inputs)));
+      std::make_shared<Network>(system, model, *package, std::move(inputs)));
   system.Build();
   std::cout << "cycle\tevent\tinstance\tchannel\tvalue\n";
   for (int64_t cycle = 0; cycle < cycles; ++cycle) {

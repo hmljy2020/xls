@@ -1,11 +1,11 @@
 # Stage-level XLS models for GFSIM
 
 This experiment generates a C++ GFSIM model from XLS `scheduled_proc` IR.
-The generated source defines one C++ function per stage and describes resolved
-channel connections. Stage functions call XLS bit operations directly for
-arithmetic and common data operations, and use the XLS node interpreter for
-other operations. The simulator reads the matching IR at startup. A shared
-runtime advances every proc's stages and commits its state each cycle.
+The generated source defines a concrete `gfsim::SimModule` for each proc with
+channel operations or state updates. Stage methods call XLS bit operations
+directly for arithmetic and common data operations and use the XLS node
+interpreter for other operations. The simulator reads the matching IR at
+startup for initial state and interpreter lookups.
 
 ## Run the examples
 
@@ -20,9 +20,12 @@ another executable. The script converts, optimizes, schedules, generates and
 builds each of the three designs. Generated C++, IR, schedules, handshake traces
 and counters are under `out/<example>/`.
 
-In `model.cc`, the `Eval_…_StageN` functions show the stage inputs, operations,
-channel accesses and values forwarded to the next stage. The model binds
-channel operations to named channels for each proc instance.
+In `model.cc`, start with the proc class's `Work()` and `Xfer()`. `Work()`
+calls the `WorkStageN()` methods in downstream-to-upstream order. Each method
+checks its input valid and output ready, runs the scheduled operations, then
+advances its pipeline slot if the operations complete. `Xfer()` publishes the
+next stage slots and state for the next cycle. `BuildProcs()` constructs the
+modules and connects their named FIFOs.
 
 ## Build an existing scheduled design
 

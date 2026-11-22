@@ -57,12 +57,23 @@ struct StageDescription {
 struct ProcDescription {
   const Proc* proc;
   std::vector<StageDescription> stages;
+  std::vector<ChannelNode*> ports;
+
+  bool HasWork() const {
+    return !ports.empty() || !proc->next_values().empty();
+  }
+};
+
+struct InstanceDescription {
+  std::string name;
+  size_t proc;
+  std::vector<std::string> channels;
 };
 
 struct ModelDescription {
   std::vector<ProcDescription> procs;
   std::vector<ChannelSpec> channels;
-  std::vector<InstanceSpec> instances;
+  std::vector<InstanceDescription> instances;
 };
 
 absl::Status Unsupported(const Node* node) {
@@ -78,7 +89,8 @@ absl::StatusOr<ProcDescription> DescribeProc(Proc* proc) {
 
   ProcDescription result{
       .proc = proc,
-      .stages = std::vector<StageDescription>(proc->stages().size())};
+      .stages = std::vector<StageDescription>(proc->stages().size()),
+      .ports = {}};
   XLS_ASSIGN_OR_RETURN(std::vector<Node*> order, TopoSort(proc));
   std::unordered_set<const StateElement*> reads;
   std::unordered_set<const StateElement*> writes;
@@ -94,10 +106,12 @@ absl::StatusOr<ProcDescription> DescribeProc(Proc* proc) {
         return Unsupported(node);
       }
       has_send[stage] = true;
+      result.ports.push_back(node->As<Send>());
     } else if (node->Is<Receive>()) {
       if (!node->As<Receive>()->is_blocking()) {
         return Unsupported(node);
       }
+      result.ports.push_back(node->As<Receive>());
     } else if (node->Is<StateRead>()) {
       const StateRead* read = node->As<StateRead>();
       auto predicate = read->predicate();
@@ -139,7 +153,7 @@ absl::StatusOr<ModelDescription> DescribeModel(Package& package) {
           : ProcElaboration::ElaborateOldStylePackage(&package));
   ModelDescription model;
   std::unordered_map<ChannelInstance*, size_t> channels;
-  std::unordered_set<Proc*> procs;
+  std::unordered_map<Proc*, size_t> procs;
   std::vector<int> producers;
   std::vector<int> consumers;
 
@@ -175,30 +189,28 @@ absl::StatusOr<ModelDescription> DescribeModel(Package& package) {
 
   for (ProcInstance* instance : elaboration.proc_instances()) {
     Proc* proc = instance->proc();
-    if (procs.insert(proc).second) {
+    auto [entry, inserted] = procs.try_emplace(proc, model.procs.size());
+    if (inserted) {
       XLS_ASSIGN_OR_RETURN(ProcDescription spec, DescribeProc(proc));
       model.procs.push_back(std::move(spec));
     }
-    InstanceSpec spec{
-        .name = instance->GetName(), .proc = proc->name(), .bindings = {}};
-    bool has_state = false;
-    for (Node* node : proc->nodes()) {
-      has_state |= node->Is<Next>();
-      if (!node->Is<Send>() && !node->Is<Receive>()) {
-        continue;
-      }
-      const auto* operation = static_cast<const ChannelNode*>(node);
+    const ProcDescription& description = model.procs[entry->second];
+    if (!description.HasWork()) {
+      continue;
+    }
+    InstanceDescription spec{
+        .name = instance->GetName(), .proc = entry->second, .channels = {}};
+    for (const ChannelNode* operation : description.ports) {
       XLS_ASSIGN_OR_RETURN(
           ChannelInstance * channel,
           instance->GetChannelInstance(operation->channel_name()));
       const size_t index = channels.at(channel);
-      spec.bindings.push_back({node->GetName(), model.channels[index].name});
-      int& endpoints = node->Is<Send>() ? producers[index] : consumers[index];
+      spec.channels.push_back(model.channels[index].name);
+      int& endpoints =
+          operation->Is<Send>() ? producers[index] : consumers[index];
       ++endpoints;
     }
-    if (!spec.bindings.empty() || has_state) {
-      model.instances.push_back(std::move(spec));
-    }
+    model.instances.push_back(std::move(spec));
   }
 
   for (size_t i = 0; i < model.channels.size(); ++i) {
@@ -368,7 +380,7 @@ std::string PredicateArg(std::optional<Node*> predicate,
 }
 
 void EmitNode(std::ostream& output, const Node& node, const Variables& names,
-              NameUniquer& unique) {
+              const Variables& ports, NameUniquer& unique) {
   const std::string& name = names.at(&node);
   const char* declaration = node.GetType()->IsToken() || node.users().empty()
                                 ? "[[maybe_unused]] const Value "
@@ -376,58 +388,63 @@ void EmitNode(std::ostream& output, const Node& node, const Variables& names,
   if (node.Is<Receive>() || node.Is<StateRead>()) {
     std::string call;
     if (node.Is<Receive>()) {
-      call = absl::StrCat("stage.Receive(", Quote(node.GetName()),
-                          PredicateArg(node.As<Receive>()->predicate(), names),
-                          ")");
+      call = absl::StrCat(
+          "stage.Receive(", ports.at(&node), "_, ", Quote(node.GetName()),
+          PredicateArg(node.As<Receive>()->predicate(), names), ")");
     } else {
       call = absl::StrCat("stage.ReadState(",
                           Quote(node.As<StateRead>()->state_element()->name()),
                           ")");
     }
     const std::string pending = unique.GetSanitizedUniqueName(name + "_result");
-    output << "  const auto " << pending << " = " << call << ";\n"
-           << "  if (!" << pending << ") {\n"
-           << "    return absl::OkStatus();\n"
-           << "  }\n"
-           << "  const Value& " << name << " = *" << pending << ";\n";
+    output << "    const auto " << pending << " = " << call << ";\n"
+           << "    if (!" << pending << ".has_value()) {\n"
+           << "      return;\n"
+           << "    }\n"
+           << "    const Value& " << name << " = *" << pending << ";\n";
     return;
   }
   if (node.Is<Send>()) {
     const Send* send = node.As<Send>();
-    output << "  if (!stage.Send(" << Quote(node.GetName()) << ", "
+    output << "    if (!stage.Send(" << ports.at(&node) << "_, "
            << names.at(send->data()) << PredicateArg(send->predicate(), names)
            << ")) {\n"
-           << "    return absl::OkStatus();\n"
-           << "  }\n";
+           << "      return;\n"
+           << "    }\n";
     if (!node.users().empty()) {
-      output << "  " << declaration << name << " = Value::Token();\n";
+      output << "    " << declaration << name << " = Value::Token();\n";
     }
     return;
   }
   if (node.Is<Next>()) {
     const Next* next = node.As<Next>();
-    output << "  stage.WriteState(" << Quote(next->state_element()->name())
+    output << "    stage.WriteState(" << Quote(next->state_element()->name())
            << ", " << names.at(next->value())
            << PredicateArg(next->predicate(), names) << ");\n";
     if (!node.users().empty()) {
-      output << "  " << declaration << name << " = Value::Tuple({});\n";
+      output << "    " << declaration << name << " = Value::Tuple({});\n";
     }
     return;
   }
 
-  const std::string expr = DirectExpression(node, names);
+  std::string expr = DirectExpression(node, names);
   if (expr.empty()) {
-    output << "  XLS_ASSIGN_OR_RETURN(" << declaration << name
-           << ", stage.Interpret(" << Quote(node.GetName()) << ", {"
-           << Operands(node, names) << "}));\n";
-  } else {
-    output << "  " << declaration << name << " = " << expr << ";\n";
+    expr = absl::StrCat("stage.Interpret(", Quote(node.GetName()), ", {",
+                        Operands(node, names), "})");
   }
+  output << "    " << declaration << name << " = " << expr << ";\n";
 }
 
 void EmitStage(std::ostream& output, const StageDescription& stage,
-               std::string_view function) {
-  output << "absl::Status " << function << "(StageContext& stage) {\n";
+               size_t index, const Variables& ports) {
+  output << "  void WorkStage" << index << "() {\n"
+         << "    if (!proc_.StageReady(" << index << ", pipeline_.InputValid("
+         << index << "),\n"
+         << "                          pipeline_.OutputReady(" << index
+         << "))) {\n"
+         << "      return;\n"
+         << "    }\n"
+         << "    StageContext stage(proc_, pipeline_, " << index << ");\n";
   NameUniquer unique("_");
   Variables names;
   std::unordered_set<const Node*> local(stage.nodes.begin(), stage.nodes.end());
@@ -437,7 +454,7 @@ void EmitStage(std::ostream& output, const StageDescription& stage,
     }
     const std::string name = CppName(unique, "v_", node->GetName());
     names.emplace(node, name);
-    output << (node->GetType()->IsToken() ? "  [[maybe_unused]] " : "  ")
+    output << (node->GetType()->IsToken() ? "    [[maybe_unused]] " : "    ")
            << "const Value " << name << " = ";
     if (node->Is<Literal>()) {
       output << LiteralExpression(*node->As<Literal>());
@@ -456,44 +473,119 @@ void EmitStage(std::ostream& output, const StageDescription& stage,
   }
   for (const Node* node : stage.nodes) {
     names.emplace(node, CppName(unique, "v_", node->GetName()));
-    EmitNode(output, *node, names, unique);
+    EmitNode(output, *node, names, ports, unique);
   }
   for (const Node* live : stage.live_out) {
-    output << "  stage.Forward(" << Quote(live->GetName()) << ", "
+    output << "    stage.Forward(" << Quote(live->GetName()) << ", "
            << names.at(live) << ");\n";
   }
-  output << "  return absl::OkStatus();\n}\n\n";
+  output << "    pipeline_.Advance(" << index << ", stage.Commit());\n"
+         << "  }\n\n";
+}
+
+void EmitProc(std::ostream& output, const ProcDescription& proc,
+              std::string_view name) {
+  NameUniquer unique("_");
+  Variables ports;
+  output << "class " << name << " final : public gfsim::SimModule {\n"
+         << " public:\n"
+         << "  " << name << "(std::string name, Proc& ir";
+  for (const ChannelNode* port : proc.ports) {
+    const std::string param = CppName(unique, port->Is<Send>() ? "out_" : "in_",
+                                      port->channel_name());
+    ports.emplace(port, param);
+    output << ",\n      const SimChannel& " << param;
+  }
+  output << ")\n"
+         << "      : SimModule(std::move(name)), proc_(*this, ir, "
+         << proc.stages.size() << ")";
+  for (const ChannelNode* port : proc.ports) {
+    const std::string& param = ports.at(port);
+    output << ",\n        " << param << "_(" << param << ")";
+  }
+  output << " {\n";
+  for (const ChannelNode* port : proc.ports) {
+    output << "    " << (port->Is<Send>() ? "BindOutput" : "BindInput") << "("
+           << ports.at(port) << "_.queue);\n";
+  }
+  output << "  }\n\n"
+         << "  void Build() override { SetObjectCapacity(0); }\n\n"
+         << "  void Reset() override {\n"
+         << "    pipeline_.Reset();\n"
+         << "    proc_.Reset();\n"
+         << "  }\n\n"
+         << "  void Work() override {\n"
+         << "    pipeline_.BeginCycle();\n"
+         << "    proc_.BeginCycle();\n\n"
+         << "    // Run downstream first so an upstream stage can refill a "
+            "freed slot.\n";
+  for (size_t i = proc.stages.size(); i-- > 0;) {
+    output << "    WorkStage" << i << "();\n";
+  }
+  output << "  }\n\n"
+         << "  void Xfer() override {\n"
+         << "    pipeline_.EndCycle();\n"
+         << "    proc_.PublishState();\n"
+         << "  }\n\n"
+         << "  void ReportStat() override { proc_.ReportStat(Report()); }\n\n"
+         << " private:\n";
+  for (size_t i = 0; i < proc.stages.size(); ++i) {
+    EmitStage(output, proc.stages[i], i, ports);
+  }
+  output << "  Pipeline<StageValues> pipeline_{" << proc.stages.size() << "};\n"
+         << "  ProcRuntime proc_;\n";
+  for (const ChannelNode* port : proc.ports) {
+    output << "  const SimChannel& " << ports.at(port) << "_;\n";
+  }
+  output << "};\n\n";
 }
 
 std::string EmitModel(const ModelDescription& model) {
   std::ostringstream output;
   output << "// Generated from XLS scheduled_proc IR.\n"
-         << "#include \"xls/experimental/stage_gfsim/model.h\"\n"
+         << "#include <memory>\n"
+         << "#include <string>\n"
+         << "#include <utility>\n\n"
+         << "#include \"absl/status/status.h\"\n"
          << "#include \"xls/common/status/status_macros.h\"\n"
-         << "#include \"xls/ir/bits_ops.h\"\n\n"
+         << "#include \"xls/experimental/stage_gfsim/model.h\"\n"
+         << "#include \"xls/experimental/stage_gfsim/proc_runtime.h\"\n"
+         << "#include \"xls/ir/bits_ops.h\"\n"
+         << "#include \"xls/ir/package.h\"\n\n"
          << "namespace xls::stage_gfsim {\nnamespace {\n\n";
 
   NameUniquer unique("_");
-  std::vector<std::vector<std::string>> functions;
-  for (const ProcDescription& proc : model.procs) {
-    auto& stages = functions.emplace_back();
-    for (size_t i = 0; i < proc.stages.size(); ++i) {
-      stages.push_back(CppName(unique, "Eval_",
-                               absl::StrCat(proc.proc->name(), "_Stage", i)));
-      EmitStage(output, proc.stages[i], stages.back());
-    }
-  }
-  output << "const ModelSpec kModel{\n    .procs = {\n";
+  std::vector<std::string> classes(model.procs.size());
+  std::vector<std::string> ir_names(model.procs.size());
   for (size_t i = 0; i < model.procs.size(); ++i) {
-    output << "        {\n          .name = "
-           << Quote(model.procs[i].proc->name())
-           << ",\n          .stages = {\n";
-    for (const std::string& function : functions[i]) {
-      output << "              " << function << ",\n";
+    const ProcDescription& proc = model.procs[i];
+    if (proc.HasWork()) {
+      classes[i] = CppName(unique, "Proc_", proc.proc->name());
+      ir_names[i] = CppName(unique, "ir_", proc.proc->name());
+      EmitProc(output, proc, classes[i]);
     }
-    output << "          },\n        },\n";
   }
-  output << "    },\n    .channels = {\n";
+  output << "absl::Status BuildProcs(gfsim::SimModule& network, Package& "
+            "package,\n"
+         << "                        const Channels& channels) {\n";
+  for (size_t i = 0; i < model.procs.size(); ++i) {
+    if (!classes[i].empty()) {
+      output << "  XLS_ASSIGN_OR_RETURN(Proc* " << ir_names[i] << ",\n"
+             << "                       package.GetProc("
+             << Quote(model.procs[i].proc->name()) << "));\n";
+    }
+  }
+  for (const InstanceDescription& instance : model.instances) {
+    output << "  network.AddSubmodule(std::make_shared<"
+           << classes[instance.proc] << ">(\n      " << Quote(instance.name)
+           << ",\n      *" << ir_names[instance.proc];
+    for (const std::string& channel : instance.channels) {
+      output << ",\n      *channels.at(" << Quote(channel) << ")";
+    }
+    output << "));\n";
+  }
+  output << "  return absl::OkStatus();\n}\n\n"
+         << "const ModelSpec kModel{\n    .channels = {\n";
   for (const ChannelSpec& channel : model.channels) {
     const char* port = "kInternal";
     if (channel.port == Port::kInput) {
@@ -505,18 +597,9 @@ std::string EmitModel(const ModelDescription& model) {
            << ", .port = Port::" << port << ", .depth = " << channel.depth
            << "},\n";
   }
-  output << "    },\n    .instances = {\n";
-  for (const InstanceSpec& instance : model.instances) {
-    output << "        {\n          .name = " << Quote(instance.name)
-           << ",\n          .proc = " << Quote(instance.proc)
-           << ",\n          .bindings = {\n";
-    for (const Binding& binding : instance.bindings) {
-      output << "              {.node = " << Quote(binding.node)
-             << ", .channel = " << Quote(binding.channel) << "},\n";
-    }
-    output << "          },\n        },\n";
-  }
-  output << "    },\n};\n}  // namespace\n}  // namespace xls::stage_gfsim\n\n"
+  output << "    },\n    .proc_count = " << model.instances.size()
+         << ",\n    .build_procs = BuildProcs,\n"
+         << "};\n\n}  // namespace\n}  // namespace xls::stage_gfsim\n\n"
          << "int main(int argc, char** argv) {\n"
          << "  return xls::stage_gfsim::RunModel(argc, argv, "
             "xls::stage_gfsim::kModel);\n"

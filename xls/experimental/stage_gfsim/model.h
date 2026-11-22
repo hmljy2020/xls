@@ -15,47 +15,25 @@
 #ifndef XLS_EXPERIMENTAL_STAGE_GFSIM_MODEL_H_
 #define XLS_EXPERIMENTAL_STAGE_GFSIM_MODEL_H_
 
-#include <optional>
+#include <cstddef>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "absl/status/status.h"
-#include "absl/status/statusor.h"
-#include "absl/types/span.h"
-#include "xls/ir/value.h"
 
-namespace xls::stage_gfsim {
+namespace gfsim {
+class SimModule;
+}
 
-// A stage sees the current cycle's inputs. Side effects are recorded here and
-// committed by the runtime when the stage advances.
-class StageContext {
- public:
-  struct Data;
-  explicit StageContext(Data& data) : data_(data) {}
+namespace xls {
+class Package;
 
-  const Value& Input(std::string_view name) const;
-  const Value& Literal(std::string_view name) const;
-  absl::StatusOr<Value> Interpret(std::string_view name,
-                                  absl::Span<const Value> operands) const;
+namespace stage_gfsim {
 
-  std::optional<Value> Receive(std::string_view node, bool enabled = true);
-  bool Send(std::string_view node, const Value& value, bool enabled = true);
-  const Value* ReadState(std::string_view element);
-  void WriteState(std::string_view element, const Value& value,
-                  bool enabled = true);
-  void Forward(std::string_view name, Value value);
-
- private:
-  Data& data_;
-};
-
-using StageFunction = absl::Status (*)(StageContext&);
-
-struct ProcSpec {
-  std::string name;
-  std::vector<StageFunction> stages;
-};
+struct SimChannel;
+using Channels = std::unordered_map<std::string_view, SimChannel*>;
 
 enum class Port { kInternal, kInput, kOutput };
 
@@ -65,26 +43,16 @@ struct ChannelSpec {
   int depth;
 };
 
-struct Binding {
-  std::string node;
-  std::string channel;
-};
-
-struct InstanceSpec {
-  std::string name;
-  std::string proc;
-  std::vector<Binding> bindings;
-};
-
 struct ModelSpec {
-  std::vector<ProcSpec> procs;
   std::vector<ChannelSpec> channels;
-  std::vector<InstanceSpec> instances;
+  std::size_t proc_count;
+  absl::Status (*build_procs)(gfsim::SimModule&, Package&, const Channels&);
 };
 
 // Simulates a model with the scheduled IR from which it was generated.
 int RunModel(int argc, char** argv, const ModelSpec& model);
 
-}  // namespace xls::stage_gfsim
+}  // namespace stage_gfsim
+}  // namespace xls
 
 #endif  // XLS_EXPERIMENTAL_STAGE_GFSIM_MODEL_H_
