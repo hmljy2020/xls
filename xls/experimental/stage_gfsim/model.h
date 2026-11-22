@@ -15,26 +15,28 @@
 #ifndef XLS_EXPERIMENTAL_STAGE_GFSIM_MODEL_H_
 #define XLS_EXPERIMENTAL_STAGE_GFSIM_MODEL_H_
 
-#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <vector>
 
-#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "xls/ir/value.h"
 
 namespace gfsim {
-class SimModule;
-}
+class SimSystem;
+}  // namespace gfsim
 
 namespace xls {
 class Package;
 
 namespace stage_gfsim {
 
-class SimChannel;
-using Channels = std::unordered_map<std::string_view, SimChannel*>;
+class NetworkRuntime;
+
+using Stimuli = std::unordered_map<std::string, std::vector<Value>>;
 
 enum class Port { kInternal, kInput, kOutput };
 
@@ -42,13 +44,19 @@ struct ChannelSpec {
   std::string name;
   Port port;
   int depth;
-  std::unique_ptr<SimChannel> (*make_channel)();
+};
+
+struct RunOptions {
+  bool trace;
+  std::string stall_output;
+  uint64_t stall_first;
+  uint64_t stall_last;
 };
 
 struct ModelSpec {
-  std::vector<ChannelSpec> channels;
-  std::size_t proc_count;
-  absl::Status (*build_procs)(gfsim::SimModule&, Package&, const Channels&);
+  std::span<const ChannelSpec> channels;
+  absl::StatusOr<std::shared_ptr<NetworkRuntime>> (*build_network)(
+      gfsim::SimSystem&, Package&, const Stimuli&, const RunOptions&);
 };
 
 // Simulates a model with the scheduled IR from which it was generated.

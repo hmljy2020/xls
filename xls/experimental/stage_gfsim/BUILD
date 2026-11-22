@@ -33,7 +33,10 @@ cc_library(
     name = "model",
     hdrs = ["model.h"],
     visibility = ["//xls/experimental/stage_gfsim:__subpackages__"],
-    deps = ["@abseil-cpp//absl/status"],
+    deps = [
+        "//xls/ir:value",
+        "@abseil-cpp//absl/status:statusor",
+    ],
 )
 
 cc_binary(
@@ -58,7 +61,13 @@ cc_binary(
 
 cc_binary(
     name = "generate",
-    srcs = ["generate.cc", "native_expression.cc", "native_expression.h"],
+    srcs = [
+        "generate.cc",
+        "native_expression.cc",
+        "native_expression.h",
+        "native_rewrites.cc",
+        "native_rewrites.h",
+    ],
     deps = [
         ":model",
         "//xls/common:exit_status",
@@ -66,6 +75,7 @@ cc_binary(
         "//xls/common/file:filesystem",
         "//xls/common/status:status_macros",
         "//xls/ir",
+        "//xls/ir:bits",
         "//xls/ir:channel",
         "//xls/ir:ir_parser",
         "//xls/ir:name_uniquer",
@@ -77,5 +87,6 @@ cc_binary(
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/status:statusor",
         "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/types:span",
     ],
 )

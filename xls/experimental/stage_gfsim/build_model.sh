@@ -48,7 +48,7 @@ cc_binary(
         "//xls/experimental/stage_gfsim/out:runtime",
         "//xls/ir",
         "//xls/ir:bits_ops",
-        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
     ],
 )
 BUILD

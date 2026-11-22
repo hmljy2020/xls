@@ -12,11 +12,19 @@ calls the generated stage methods from downstream to upstream. A stage reads
 the current members and records pending changes when it advances. `Xfer()`
 publishes those changes for the next cycle. Supported IR operations over bits
 up to 64 wide, arrays, and tuples compile to native C++ expressions and
-fixed-size storage. GFSIM queues carry those C++ types, and conversion to
-XLS `Value` is limited to input loading, initial state, and trace output.
+fixed-size storage. FIFO payloads use those C++ types, and conversion to XLS
+`Value` is limited to input loading, initial state, and trace output.
 If a model contains a type or operation the native emitter cannot handle,
 the generator uses XLS bit operations and the node interpreter for that
 model. Both paths read the matching scheduled IR at startup.
+
+The generated network binds concrete procs and fixed-capacity FIFOs. Each
+FIFO takes its admission decisions from the start of the cycle and holds
+payloads in a preallocated ring. The default cycle driver calls the generated
+`Work()` and `Xfer()` phases directly on the GFSIM module graph. Pass
+`--gfsim_step` to run the same network through `gfsim::SimSystem::Step()`.
+The native emitter may move pure expressions to their first use while
+keeping channel transfers and state effects at their scheduled stages.
 
 ## Current status
 
@@ -104,10 +112,20 @@ handling. All timed runs disable trace formatting and output. Model generation,
 compilation, Block IR lowering, IR and stimulus parsing, initialization, and
 reset are outside the timed region.
 
-| Scenario | Simulated cycles | Native GFSIM (ms) | Verilator (ms) | GFSIM Value baseline (ms) | Block interpreter (ms) |
+| Scenario | Simulated cycles | Native GFSIM baseline (ms) | Verilator (ms) | GFSIM Value baseline (ms) | Block interpreter (ms) |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Steady | 1356 | 0.719 | 0.635 | 104.4 | 563.1 |
 | Backpressure | 1483 | 0.742 | 0.689 | 110.8 | 617.2 |
+
+The compiled cycle driver was measured on the same workload, compiler mode
+and pinned core. These are medians from 11 interleaved runs after warmup. The
+two drivers also match every transfer value, cycle and stage counter with
+tracing enabled.
+
+| Scenario | Compiled GFSIM (µs) | GFSIM Step (µs) | Verilator (µs) | Verilator / compiled GFSIM |
+| --- | ---: | ---: | ---: | ---: |
+| Steady | 60.8 | 86.2 | 634.5 | 10.43× |
+| Backpressure | 63.5 | 91.2 | 685.9 | 10.81× |
 
 To time the generated GFSIM model, generate the long example first and then
 build its simulator in optimized mode. The program prints `simulation_ns`

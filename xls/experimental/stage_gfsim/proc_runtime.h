@@ -15,13 +15,14 @@
 #ifndef XLS_EXPERIMENTAL_STAGE_GFSIM_PROC_RUNTIME_H_
 #define XLS_EXPERIMENTAL_STAGE_GFSIM_PROC_RUNTIME_H_
 
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -38,44 +39,21 @@ class Proc;
 
 namespace stage_gfsim {
 
-class ChannelOwner : public gfsim::SimModule {
- public:
-  using SimModule::SimModule;
-
-  template <typename Data>
-  gfsim::SimQueue<Data>* Attach(std::shared_ptr<gfsim::SimQueue<Data>> queue,
-                                Port role) {
-    auto* port = AddInnerQueue(std::move(queue));
-    if (role == Port::kInput) {
-      BindOutput(port);
-    } else if (role == Port::kOutput) {
-      BindInput(port);
-    }
-    return port;
-  }
-};
-
-// The network drives all channels uniformly. Generated modules bind the
-// concrete typed queues and move data without converting to XLS Value.
+// Channels are owned by the network. Admission is snapshotted at the
+// beginning of Work, so each endpoint sees the same one-cycle FIFO boundary.
 class SimChannel {
  public:
   virtual ~SimChannel() = default;
-  virtual void Build(ChannelOwner& owner, const ChannelSpec& spec,
-                     bool trace) = 0;
-  virtual void AddInput(const Value& input) = 0;
-  virtual void ResetInputs() = 0;
-  virtual void Sample() = 0;
-  virtual bool Source(gfsim::SimModule& module) = 0;
-  virtual void Consume(gfsim::SimModule& module,
-                       std::string_view kind) const = 0;
-  virtual void Produce(gfsim::SimModule& module, const void* data) const = 0;
+  virtual void Consume(gfsim::SimModule& module, std::string_view kind) = 0;
+  virtual void Produce(gfsim::SimModule& module, const void* data) = 0;
 
   bool readable = false;
   bool writable = false;
 };
 
-void TraceTransfer(gfsim::SimModule& module, std::string_view kind,
-                   const gfsim::SimObj& queue, const Value& value);
+void TraceTransfer(uint64_t cycle, gfsim::SimModule& module,
+                   std::string_view kind, std::string_view queue,
+                   const Value& value);
 
 struct ValueCodec {
   using Type = Value;
@@ -87,85 +65,182 @@ template <typename Codec>
 class TypedChannel final : public SimChannel {
  public:
   using Data = typename Codec::Type;
-  using Queue = gfsim::SimQueue<Data>;
 
-  Queue* queue() const { return queue_; }
+  TypedChannel(const ChannelSpec& spec, const RunOptions& options,
+               const uint64_t& cycle)
+      : name_(spec.name),
+        cycle_(cycle),
+        trace_(options.trace),
+        stall_first_(spec.name == options.stall_output ? options.stall_first
+                                                       : 0),
+        stall_last_(spec.name == options.stall_output ? options.stall_last : 0),
+        slots_(std::bit_ceil(static_cast<unsigned>(spec.depth))),
+        mask_(slots_.size() - 1),
+        capacity_(spec.depth) {}
 
-  void Build(ChannelOwner& owner, const ChannelSpec& spec,
-             bool trace) override {
-    auto queue = std::make_shared<Queue>(spec.name);
-    queue->InitMaxSize(spec.depth);
-    queue->Setlatency(1);
-    queue_ = owner.Attach(std::move(queue), spec.port);
-    trace_ = trace;
+  void LoadInputs(const Stimuli& stimuli) {
+    for (const Value& input : stimuli.at(std::string(name_))) {
+      inputs_.push_back(Codec::FromValue(input));
+    }
   }
 
-  void AddInput(const Value& input) override {
-    inputs_.push_back(MakePacket(Codec::FromValue(input)));
-  }
-  void ResetInputs() override { next_input_ = 0; }
+  void Reset() { head_ = tail_ = size_ = next_input_ = 0; }
 
-  void Sample() override {
-    readable = !queue_->Empty();
-    writable = !queue_->Full();
+  void Sample() {
+    readable = (size_ != 0);
+    writable = (size_ < capacity_);
   }
 
-  bool Source(gfsim::SimModule& module) override {
+  const Data& Peek() const { return slots_[head_]; }
+
+  template <bool kTrace>
+  bool Source(gfsim::SimModule& module) {
     if (!writable || next_input_ == inputs_.size()) {
       return false;
     }
-    const Packet& input = inputs_[next_input_++];
-    if (trace_) {
-      TraceTransfer(module, "source", *queue_, Codec::ToValue(DataOf(input)));
-    }
-    queue_->Write(input);
+    Push<kTrace>(module, "source", inputs_[next_input_++]);
     return true;
   }
 
-  void Consume(gfsim::SimModule& module, std::string_view kind) const override {
-    if (trace_) {
-      TraceTransfer(module, kind, *queue_, Codec::ToValue(queue_->Peek()));
+  template <bool kTrace>
+  bool Sink(gfsim::SimModule& module, uint64_t cycle) {
+    if (!readable || cycle - stall_first_ <= stall_last_ - stall_first_) {
+      return false;
     }
-    queue_->Pop();
+    CommitRead<kTrace>(module, "sink");
+    return true;
   }
 
-  void Produce(gfsim::SimModule& module, const void* data) const override {
-    const Data& value = *static_cast<const Data*>(data);
-    queue_->Write(MakePacket(value));
+  template <bool kTrace>
+  void CommitRead(gfsim::SimModule& module, std::string_view kind) {
+    if constexpr (kTrace) {
+      TraceTransfer(cycle_, module, kind, name_, Codec::ToValue(Peek()));
+    }
+    head_ = Advance(head_);
+    --size_;
+  }
+
+  template <bool kTrace>
+  void CommitWrite(gfsim::SimModule& module, const Data& data) {
+    Push<kTrace>(module, "send", data);
+  }
+
+  void Consume(gfsim::SimModule& module, std::string_view kind) override {
     if (trace_) {
-      TraceTransfer(module, "send", *queue_, Codec::ToValue(value));
+      CommitRead<true>(module, kind);
+    } else {
+      CommitRead<false>(module, kind);
+    }
+  }
+
+  void Produce(gfsim::SimModule& module, const void* data) override {
+    const auto& value = *static_cast<const Data*>(data);
+    if (trace_) {
+      CommitWrite<true>(module, value);
+    } else {
+      CommitWrite<false>(module, value);
     }
   }
 
  private:
-  using Packet = typename Queue::Packet;
+  size_t Advance(size_t index) const { return (index + 1) & mask_; }
 
-  // GFSIM queues store scalars directly and class payloads by shared pointer.
-  static Packet MakePacket(const Data& data) {
-    if constexpr (std::is_same_v<Data, Packet>) {
-      return data;
-    } else {
-      return std::make_shared<Data>(data);
-    }
-  }
-  static const Data& DataOf(const Packet& packet) {
-    if constexpr (std::is_same_v<Data, Packet>) {
-      return packet;
-    } else {
-      return *packet;
+  template <bool kTrace>
+  void Push(gfsim::SimModule& module, std::string_view kind, const Data& data) {
+    slots_[tail_] = data;
+    tail_ = Advance(tail_);
+    ++size_;
+    if constexpr (kTrace) {
+      TraceTransfer(cycle_, module, kind, name_, Codec::ToValue(data));
     }
   }
 
-  Queue* queue_ = nullptr;
-  bool trace_ = false;
-  std::vector<Packet> inputs_;
+  std::string_view name_;
+  const uint64_t& cycle_;
+  bool trace_;
+  uint64_t stall_first_;
+  uint64_t stall_last_;
+  std::vector<Data> slots_;
+  size_t mask_;
+  size_t capacity_;
+  size_t head_ = 0;
+  size_t tail_ = 0;
+  size_t size_ = 0;
+  std::vector<Data> inputs_;
   size_t next_input_ = 0;
 };
 
-template <typename Codec>
-std::unique_ptr<SimChannel> MakeChannel() {
-  return std::make_unique<TypedChannel<Codec>>();
-}
+// Clock and reporting shared by compiled networks. Each generated Work calls
+// its concrete channels and procs in the same order as elaboration.
+class NetworkRuntime : public gfsim::SimModule {
+ public:
+  explicit NetworkRuntime(gfsim::SimSystem& system)
+      : SimModule("stage_gfsim", &system), system_(system) {}
+
+  void Reset() override;
+  void ReportStat() override;
+  virtual void RunCompiled(uint64_t cycles) = 0;
+
+ protected:
+  const uint64_t& Cycle() const { return cycle_; }
+  void AdvanceCycle() { ++cycle_; }
+
+  template <bool kTrace, typename Codec>
+  bool Source(TypedChannel<Codec>& channel) {
+    if (channel.template Source<kTrace>(*this)) {
+      if (first_source_ == 0) {
+        first_source_ = cycle_;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  template <bool kTrace, typename Codec>
+  bool Sink(TypedChannel<Codec>& channel) {
+    if (channel.template Sink<kTrace>(*this, cycle_)) {
+      last_sink_ = cycle_;
+      ++delivered_;
+      return true;
+    }
+    return false;
+  }
+
+  void MarkProgress() { system_.MarkProgress(); }
+
+ private:
+  gfsim::SimSystem& system_;
+  uint64_t cycle_ = 0;
+  uint64_t delivered_ = 0;
+  uint64_t first_source_ = 0;
+  uint64_t last_sink_ = 0;
+};
+
+// Large states publish by changing the bank index, without another copy on
+// Xfer. Work can still read the old state after proposing a write.
+template <typename Data>
+class BufferedState {
+ public:
+  const Data& Current() const { return banks_[current_]; }
+  void Reset(const Data& initial) {
+    current_ = 0;
+    pending_ = false;
+    banks_[0] = initial;
+  }
+  void Propose(const Data& value) {
+    banks_[current_ ^ 1] = value;
+    pending_ = true;
+  }
+  void Xfer() {
+    current_ ^= pending_;
+    pending_ = false;
+  }
+
+ private:
+  std::array<Data, 2> banks_;
+  unsigned current_ = 0;
+  bool pending_ = false;
+};
 
 // IR lookups and counters for one generated proc module.
 class ProcRuntime {
@@ -174,7 +249,46 @@ class ProcRuntime {
               bool interpret);
   void Reset();
   const Value& InitialState(std::string_view name) const;
-  bool StageReady(std::size_t index, bool input_valid, bool output_ready);
+  bool StageReady(std::size_t index, bool input_valid, bool output_ready) {
+    if (!input_valid) {
+      ++stats_[index].input;
+      return false;
+    }
+    if (!output_ready) {
+      ++stats_[index].output;
+      return false;
+    }
+    return true;
+  }
+
+  bool InputReady(std::size_t index, bool ready) {
+    if (!ready) {
+      ++stats_[index].input;
+    }
+    return ready;
+  }
+
+  bool OutputReady(std::size_t index, bool ready) {
+    if (!ready) {
+      ++stats_[index].output;
+    }
+    return ready;
+  }
+
+  bool StateReady(std::size_t index, bool available) {
+    if (!available) {
+      ++stats_[index].state;
+    }
+    return available;
+  }
+
+  void BeginCycle() { progressed_ = false; }
+  bool Progressed() const { return progressed_; }
+
+  void StageFired(std::size_t index) {
+    ++stats_[index].fired;
+    progressed_ = true;
+  }
   void ReportStat(gfsim::Reporter& report) const;
 
  private:
@@ -189,6 +303,7 @@ class ProcRuntime {
 
   gfsim::SimModule& module_;
   Proc& ir_;
+  bool progressed_ = false;
   std::unordered_map<std::string, Node*> nodes_;
   std::vector<StageStats> stats_;
 };
@@ -203,36 +318,35 @@ class StageContext {
   Value Interpret(std::string_view name,
                   absl::Span<const Value> operands) const;
 
-  std::optional<Value> Receive(const TypedChannel<ValueCodec>& channel,
+  std::optional<Value> Receive(TypedChannel<ValueCodec>& channel,
                                std::string_view node, bool enabled = true);
   template <typename Codec>
-  const typename Codec::Type* ReceiveData(const TypedChannel<Codec>& channel) {
+  const typename Codec::Type* ReceiveData(TypedChannel<Codec>& channel) {
     if (!ReceiveReady(channel)) {
       return nullptr;
     }
-    return &channel.queue()->Peek();
+    return &channel.Peek();
   }
   template <typename Codec>
-  bool Send(const TypedChannel<Codec>& channel,
-            const typename Codec::Type& data, bool enabled = true) {
+  bool Send(TypedChannel<Codec>& channel, const typename Codec::Type& data,
+            bool enabled = true) {
     return ProposeSend(channel, &data, enabled);
   }
-  bool StateReady(bool available);
   void Finish();
 
  private:
   struct SendEffect {
-    const SimChannel* channel;
+    SimChannel* channel;
     // The generated stage keeps the data alive through Finish().
     const void* data;
   };
 
-  bool ReceiveReady(const SimChannel& channel);
-  bool ProposeSend(const SimChannel& channel, const void* data, bool enabled);
+  bool ReceiveReady(SimChannel& channel);
+  bool ProposeSend(SimChannel& channel, const void* data, bool enabled);
 
   ProcRuntime& proc_;
   std::size_t index_;
-  absl::InlinedVector<const SimChannel*, 1> receives_;
+  absl::InlinedVector<SimChannel*, 1> receives_;
   std::optional<SendEffect> send_;
 };
 
